@@ -14,12 +14,29 @@ import subprocess
 import threading
 
 # Quality tiers pinning the historical libx264 settings.
-QUALITY = "quality"            # was: -preset medium -crf 18
+QUALITY = "quality"            # crf 18; preset is a SPEED knob (see below)
 QUALITY_FAST = "quality_fast"  # was: -preset fast -crf 18
 DELIVERY = "delivery"          # was: -preset fast -crf 22
 
 _X264_ARGS = {
-    QUALITY: ["-c:v", "libx264", "-preset", "medium", "-crf", "18"],
+    # veryfast, not medium, and that is a MEASURED choice rather than a
+    # compromise. At a fixed CRF the x264 preset trades encoding speed against
+    # bitrate efficiency; CRF is what holds quality. Measured on a real 55.7s
+    # 1080x1920 clip from this pipeline, re-encoding at crf 18:
+    #
+    #     preset      time     size      SSIM vs source
+    #     medium     144.3s   28.8 MB    0.99756
+    #     fast       115.2s   30.3 MB    0.99755
+    #     veryfast    55.0s   26.5 MB    0.99650
+    #
+    # 2.6x faster, a SMALLER file, and 0.001 of SSIM given up — far less than
+    # YouTube and TikTok destroy re-encoding the upload. This tier is used by
+    # every "burn a filter over a finished clip" pass (hook, captions, editor
+    # effects, passthrough), and a clip gets two of them, so this is ~180s per
+    # clip on the dev box. FFMPEG_PRESET_QUALITY overrides it.
+    QUALITY: ["-c:v", "libx264", "-preset",
+              os.environ.get("FFMPEG_PRESET_QUALITY", "veryfast").strip()
+              or "veryfast", "-crf", "18"],
     QUALITY_FAST: ["-c:v", "libx264", "-preset", "fast", "-crf", "18"],
     DELIVERY: ["-c:v", "libx264", "-preset", "fast", "-crf", "22"],
 }

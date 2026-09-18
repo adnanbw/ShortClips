@@ -115,10 +115,36 @@ class TestRunOrder:
             assert "\\q2" not in event
 
 
+#: Scripts the backend/renderer images are built to support. The image
+#: installs fonts-noto-core + fonts-noto-cjk for exactly these, so in an
+#: integration environment a missing glyph is a BUILD REGRESSION, not a
+#: platform quirk, and the suite must say so.
+REQUIRED_SCRIPTS = ("devanagari", "arabic", "cyrillic",
+                    "japanese", "korean", "chinese")
+
+
+def _integration_mode():
+    """True when this run is expected to have the image's fonts.
+
+    Set ASR_FONTS_REQUIRED=1 in the Docker/integration run. Left unset on a
+    minimal host CI, where the Noto packages are deliberately not installed and
+    failing on them would only punish contributors — but there the non-Latin
+    cases skip loudly rather than passing silently.
+    """
+    return os.environ.get("ASR_FONTS_REQUIRED", "").strip() == "1"
+
+
 @pytest.mark.skipif(not os.environ.get("RUN_FFMPEG_TESTS", "1") == "1",
                     reason="needs ffmpeg + the image fonts")
 class TestGlyphsActuallyRender:
-    """libass silently draws a box for a missing glyph, so assert on pixels."""
+    """libass silently draws a box for a missing glyph, so assert on pixels.
+
+    A skip is not a pass. The previous version skipped whenever a script
+    rendered nothing, which meant a green suite proved only that Latin worked —
+    the image could have shipped with no Devanagari at all and nothing would
+    have complained. In integration mode every script in REQUIRED_SCRIPTS must
+    now actually put ink on the frame.
+    """
 
     SAMPLES = {
         "latin": "this is the baseline",
@@ -148,6 +174,9 @@ class TestGlyphsActuallyRender:
              f"ass=filename='{ass}':fontsdir='{fonts}'",
              "-frames:v", "1", str(shot)], capture_output=True)
         if result.returncode != 0:
+            if _integration_mode():
+                pytest.fail(f"ffmpeg could not burn a {name} subtitle: "
+                            f"{result.stderr.decode(errors='replace')[-500:]}")
             pytest.skip("ffmpeg could not burn the subtitle here")
         image = Image.open(shot).convert("L")
         return sum(1 for pixel in image.getdata() if pixel > 40)
@@ -155,6 +184,52 @@ class TestGlyphsActuallyRender:
     @pytest.mark.parametrize("name", sorted(SAMPLES))
     def test_script_renders_ink(self, tmp_path, name):
         ink = self._ink(tmp_path, name, self.SAMPLES[name])
-        if name != "latin" and ink == 0:
-            pytest.skip("this image has no font for %s" % name)
-        assert ink > 1000, f"{name} rendered almost nothing ({ink} pixels)"
+
+        if ink == 0 and name in REQUIRED_SCRIPTS and not _integration_mode():
+            pytest.skip(f"this host has no font for {name} "
+                        f"(set ASR_FONTS_REQUIRED=1 to make that a failure)")
+
+        assert ink > 1000, (
+            f"{name} rendered almost nothing ({ink} pixels) — the image is "
+            f"missing a font for it, so captions in this script burn as boxes")
+
+    def test_every_supported_script_is_covered_by_a_case(self):
+        # Guards the list itself: adding a script to the image without a test
+        # would otherwise leave it unverified forever.
+        assert set(REQUIRED_SCRIPTS) <= set(self.SAMPLES)
+
+
+@pytest.mark.skipif(not _integration_mode(),
+                    reason="integration only: set ASR_FONTS_REQUIRED=1 in the "
+                           "Docker run, where the image's fonts must exist")
+class TestImageReallyShipsTheFonts:
+    """The authoritative check, run against the built image.
+
+    Rendering ink proves a glyph came from somewhere; fontconfig proves the
+    IMAGE owns a font for the script, which is what the Dockerfile change is
+    supposed to guarantee.
+    """
+
+    LANGS = {"devanagari": "hi", "arabic": "ar", "cyrillic": "ru",
+             "japanese": "ja", "korean": "ko", "chinese": "zh"}
+
+    @pytest.mark.parametrize("script,lang", sorted(LANGS.items()))
+    def test_fontconfig_knows_a_font_for_the_script(self, script, lang):
+        result = subprocess.run(["fc-list", f":lang={lang}", "family"],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, "fontconfig is not installed in this image"
+        families = [line for line in result.stdout.splitlines() if line.strip()]
+        assert families, (
+            f"no font in the image covers {script} ({lang}); captions in it "
+            f"will render as boxes. Check fonts-noto-core / fonts-noto-cjk "
+            f"in the Dockerfile.")
+
+    def test_anton_falls_back_rather_than_dropping_a_glyph(self):
+        # The caption default is Anton, which is Latin-only. fontconfig must
+        # offer a real fallback after it, or the <default> rules in
+        # fonts/openshorts-fontmap.conf are not being loaded.
+        result = subprocess.run(["fc-match", "-s", "Anton:lang=hi", "family"],
+                                capture_output=True, text=True)
+        assert result.returncode == 0
+        chain = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert any("Noto" in family for family in chain[:6]), chain[:6]

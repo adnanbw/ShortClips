@@ -722,6 +722,55 @@ def plan_download_attempts(direct_first, statics, paid, have_hd, youtube=True):
     return plan
 
 
+def _relax_bgutil_timeouts():
+    """Give the PO-token provider room to start on a loaded machine.
+
+    The bgutil yt-dlp plugin hardcodes a 15 s budget for `node ...
+    generate_once.js --version`, the availability probe it runs before every
+    extraction, and offers no env var or extractor-arg to change it. That is
+    generous on an idle box and far too tight on a busy one: measured on this
+    dev machine while a docker build was running, the very same command took
+    **56 seconds** and returned the correct answer.
+
+    When it times out, the provider is not merely skipped — the exception
+    escapes through `is_available()` and kills EVERY download strategy, and the
+    job then reports "YouTube blocked the request or the download tooling is
+    out of date", which is false and sends whoever reads it to look at proxies
+    and cookies. This is not only a build-time problem: MAX_CONCURRENT_JOBS
+    defaults to 5 and a render is CPU-hungry, so five of them can starve a
+    sixth job's download the same way.
+
+    Patched defensively — a plugin that renames or drops these attributes just
+    means no patch, never a crash on import.
+    """
+    # Read it out of sys.modules; NEVER import it here. yt-dlp's plugin loader
+    # enumerates the module and registers each provider, and importing it first
+    # runs the registration twice — "AssertionError: PoTokenProvider
+    # BgUtilScriptNode already registered", which yt-dlp swallows as "Error
+    # while importing module ...". Measured in the container: building a
+    # YoutubeDL alone is clean, doing it after this import is not. So this runs
+    # AFTER yt-dlp has loaded its plugins, and is a no-op before that.
+    provider = sys.modules.get(
+        "yt_dlp_plugins.extractor.getpot_bgutil_script")
+    if provider is None:
+        return
+
+    try:
+        budget = float(os.environ.get("BGUTIL_PROBE_TIMEOUT", "90") or 90)
+    except (TypeError, ValueError):
+        budget = 90.0
+
+    for cls_name in dir(provider):
+        cls = getattr(provider, cls_name, None)
+        for attr in ("_GET_SCRIPT_VSN_TIMEOUT", "_GETPOT_TIMEOUT"):
+            current = getattr(cls, attr, None)
+            if isinstance(current, (int, float)) and current < budget:
+                try:
+                    setattr(cls, attr, budget)
+                except Exception:
+                    pass
+
+
 def download_youtube_video(url, output_dir="."):
     """
     Downloads a YouTube video using yt-dlp.
@@ -842,6 +891,9 @@ def download_youtube_video(url, output_dir="."):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
         with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
+            # Constructing YoutubeDL is what loads the plugins, so the patch
+            # goes here rather than before the attempt.
+            _relax_bgutil_timeouts()
             info = ydl.extract_info(url, download=False)
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
         expected = os.path.join(output_dir, f'{sanitized}.mp4')
@@ -855,6 +907,7 @@ def download_youtube_video(url, output_dir="."):
             'progress_hooks': [_progress_hook],
         }
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            _relax_bgutil_timeouts()
             ydl.download([url])
         return sanitized
 
@@ -1464,18 +1517,56 @@ def clear_transcript_checkpoint(output_dir):
         print(f"⚠️ Could not remove transcript checkpoint: {e}")
 
 
-def transcribe_video(video_path, duration=None, output_dir=None):
+def kaggle_worker_start(url, output_dir):
+    """Dispatch the remote transcription, or return None. Never raises."""
+    try:
+        import kaggle_worker
+    except Exception:
+        return None
+    if not kaggle_worker.enabled():
+        return None
+    job_id = os.path.basename(str(output_dir or "").rstrip("/\\")) or "job"
+    try:
+        return kaggle_worker.start(url, job_id=job_id)
+    except Exception as e:
+        print(f"⚠️ Could not dispatch to Kaggle ({type(e).__name__}: {e})")
+        return None
+
+
+def transcribe_video(video_path, duration=None, output_dir=None,
+                     remote=None):
     """Transcribe through the adaptive quality-gated path.
 
     The gate retries once with a stronger multilingual model when the first
     transcript looks unreliable, and raises TranscriptQualityError when it
     still is — so a video whose audio could not be recognized fails saying
     that, instead of surfacing later as "clip detection failed".
+
+    ``remote`` is a ``kaggle_worker.RemoteTranscription`` dispatched back when
+    the job started, before the download. By the time we get here it has
+    usually been running for as long as the download took, so collecting it is
+    often instant. It is strictly an accelerator — no credentials, no GPU
+    quota, a kernel error, a timeout or a transcript that fails the quality
+    gate all fall straight through to the local path below, because a job must
+    never fail for want of an optional machine.
     """
     print("🎙️  Transcribing video...")
-    from transcribe_backends import transcribe_media_checked
+    from transcribe_backends import transcribe_media_checked, judge_remote_transcript
 
     debug_dir = os.path.join(output_dir, "meaningful_debug") if output_dir else None
+
+    if remote is not None:
+        print("☁️  Collecting the Kaggle transcription...")
+        payload = remote.collect()
+        if payload is not None:
+            judged = judge_remote_transcript(
+                payload, duration=duration, debug_dir=debug_dir)
+            if judged is not None:
+                print(f"   Detected language '{judged['language']}', "
+                      f"{len(judged['segments'])} segments (via Kaggle)")
+                return judged
+        print("🎙️  Transcribing locally instead...")
+
     transcript = transcribe_media_checked(
         video_path, duration=duration, debug_dir=debug_dir)
 
@@ -1722,6 +1813,27 @@ MIN_SPEECH_WORDS_PER_MIN = float(os.environ.get("MIN_SPEECH_WORDS_PER_MIN", "5")
 MIN_SPEECH_WORDS = int(os.environ.get("MIN_SPEECH_WORDS", "8"))
 
 
+NO_CLIPS_MESSAGE = (
+    "Clip detection failed — the AI model did not return usable clips for this video.")
+
+
+def clip_failure_message(transcript):
+    """Which failure this actually was, for the user.
+
+    When the language check already found that parts of the transcript are not
+    real words, "the AI model did not return usable clips" names the wrong
+    stage: the selector behaved correctly on input it could not use. That
+    mislabelling is the whole reason the quality gate exists, so it must not
+    reappear at the last step.
+    """
+    from asr_quality import TranscriptQualityError
+
+    quality = (((transcript or {}).get("asr") or {}).get("quality") or {})
+    if quality.get("status") in ("PARTIAL", "BAD"):
+        return TranscriptQualityError.USER_MESSAGE
+    return NO_CLIPS_MESSAGE
+
+
 def speech_is_sparse(transcript, duration):
     """True when the transcript is too thin to drive clip selection.
 
@@ -1874,8 +1986,17 @@ if __name__ == '__main__':
             else:
                 output_dir = "."
         
+        # Fire the Kaggle transcription BEFORE downloading, not after. Both
+        # fetch the same YouTube URL independently — Kaggle grabs the audio
+        # (~9s from its egress), we grab the video for rendering — so there is
+        # no reason for one to wait on the other. Serialising them cost the
+        # whole download plus the local language probe, ~50-90s per job, while
+        # the GPU sat idle. The language probe now runs inside the worker, on
+        # the GPU, which is what removed the dependency.
+        remote_transcription = kaggle_worker_start(args.url, output_dir)
         input_video, video_title = download_youtube_video(args.url, output_dir)
     else:
+        remote_transcription = None
         input_video = args.input
         video_title = os.path.splitext(os.path.basename(input_video))[0]
         
@@ -1964,7 +2085,8 @@ if __name__ == '__main__':
         if transcript is None:
             try:
                 transcript = transcribe_video(
-                    input_video, duration=duration, output_dir=output_dir)
+                    input_video, duration=duration, output_dir=output_dir,
+                    remote=remote_transcription)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except NoAudioError as e:
                 print(f"🔇 {e} — switching to visual analysis.")
@@ -2075,8 +2197,15 @@ if __name__ == '__main__':
             # Deliberately fail instead of reframing the whole video: that path
             # wrote no metadata.json, so app.py marked the job failed anyway
             # (app.py:1087) after burning GPU on a render nobody could see.
-            raise RuntimeError(
-                "Clip detection failed — the AI model did not return usable clips for this video.")
+            #
+            # WHICH failure this is matters. When the language check already
+            # found that parts of the transcript are not real words, "the AI
+            # model did not return usable clips" names the wrong stage — the
+            # selector behaved correctly on input it could not use, which is
+            # exactly the mislabelling this whole quality gate exists to stop.
+            message = clip_failure_message(transcript)
+            print(f"❌ {message}")
+            raise RuntimeError(message)
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} clips!")
             meaningful_selection = str(clips_data.get('selector') or '').startswith('meaningful')

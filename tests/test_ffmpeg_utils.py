@@ -24,8 +24,16 @@ def _clean_encoder_state(monkeypatch):
 
 
 def test_default_args_pin_historical_x264_settings():
+    """QUALITY moved from `medium` to `veryfast` on purpose, and this test
+    failing is how that was noticed rather than shipped.
+
+    CRF is unchanged at 18 — that is the quality setting. The preset trades
+    encoding SPEED against bitrate efficiency, and measured on a real 55.7s
+    1080x1920 clip: medium 144.3s / 28.8 MB / SSIM 0.99756 against veryfast
+    55.0s / 26.5 MB / 0.99650. Faster, smaller, and 0.001 of SSIM.
+    """
     assert video_encode_args(QUALITY) == [
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
     assert video_encode_args(QUALITY_FAST) == [
         "-c:v", "libx264", "-preset", "fast", "-crf", "18"]
     assert video_encode_args(DELIVERY) == [

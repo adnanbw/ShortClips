@@ -40,6 +40,54 @@ SENTENCE_TERMINATORS = (
 _CLOSERS = "\"'”’»›)]}、」』）］｝”» "
 
 
+# ---------------------------------------------------------------------------
+# Clip duration: a PREFERENCE that is asked for, and a HARD band that is
+# enforced. Those used to be the same number, and that is what threw away the
+# best moment of a real job: the candidate's punchline landed at 107s, so the
+# only repair that could include it measured 107s, and a bare `> 90.0` check
+# deleted it — leaving the version cut off mid-sentence, which the critic then
+# correctly rejected as incomplete. A complete 100-second clip beats a
+# truncated 75-second one, every time.
+#
+# 90s was never a platform limit: YouTube Shorts allows 3 minutes, TikTok 10,
+# Reels 3. It was an editorial preference enforced as a gate. It stays a
+# preference — every prompt still asks for 25-60s and says so — and stops
+# being a gate.
+# ---------------------------------------------------------------------------
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+MIN_CLIP_SECONDS = _env_float("MEANINGFUL_MIN_CLIP_SECONDS", 15.0)
+MAX_CLIP_SECONDS = _env_float("MEANINGFUL_MAX_CLIP_SECONDS", 110.0)
+
+#: What the prompts ask for. Never enforced in code.
+PREFERRED_MIN_SECONDS = 25.0
+PREFERRED_MAX_SECONDS = 60.0
+
+#: Windows must be able to CONTAIN a maximum-length candidate plus surrounding
+#: material, or a long moment straddles two windows and is invisible in both.
+#: Tied to MAX_CLIP_SECONDS so raising one cannot silently break the other.
+CANDIDATE_WINDOW_SECONDS = max(210.0, MAX_CLIP_SECONDS * 2.2)
+CANDIDATE_OVERLAP_SECONDS = MAX_CLIP_SECONDS
+
+
+def duration_rule_text() -> str:
+    """The one sentence every prompt uses to state the duration rule."""
+    return (
+        f"{MIN_CLIP_SECONDS:.0f}-{MAX_CLIP_SECONDS:.0f} seconds is allowed.\n"
+        f"{PREFERRED_MIN_SECONDS:.0f}-{PREFERRED_MAX_SECONDS:.0f} seconds is "
+        f"strongly preferred — pick the shorter version whenever it is just as "
+        f"complete. But NEVER cut off a payoff to hit that range: a complete "
+        f"clip at {PREFERRED_MAX_SECONDS + 40:.0f} seconds is better than a "
+        f"truncated one at {PREFERRED_MAX_SECONDS:.0f}."
+    )
+
+
 def _clean_word(value: Any) -> str:
     return str(value or "").strip()
 
@@ -357,14 +405,17 @@ def format_sentences_for_ai(
 
 def build_candidate_windows(
     sentences: List[Dict[str, Any]],
-    window_seconds: float = 210.0,
-    overlap_seconds: float = 90.0,
+    window_seconds: float = CANDIDATE_WINDOW_SECONDS,
+    overlap_seconds: float = CANDIDATE_OVERLAP_SECONDS,
 ) -> List[Dict[str, Any]]:
     """
     Split a long transcript into overlapping semantic windows.
 
-    210-second windows with 90-second overlap give a <=90 second candidate
-    enough surrounding material even when the idea happens near a window edge.
+    The overlap is MAX_CLIP_SECONDS on purpose: a maximum-length candidate has
+    to fit entirely inside at least one window, with surrounding material,
+    even when the idea happens near a window edge. An overlap smaller than the
+    longest allowed clip makes long moments straddle two windows and be
+    proposable in neither.
     """
 
     if not sentences:
@@ -434,6 +485,59 @@ def build_candidate_windows(
 # the semantic quality rules are identical in every language, and the only new
 # instruction is "do not mistake a language you did not expect for a defect".
 
+# ---------------------------------------------------------------------------
+# What every judge in this pipeline is ACTUALLY looking at.
+#
+# The critic prompt used to open with "You are seeing EXACTLY AND ONLY what the
+# eventual viewer will hear", which is false in two ways that cost real clips:
+# the viewer hears SPEECH, not an imperfect transcript of it, and the viewer
+# also SEES. Measured on one Hinglish job, three of five rejections were the
+# critic marking a clip down for ASR noise -
+#   "contains significant transcription errors ('पुगली उलूश शुष')"
+#   "fragmented, repetitive, and nonsensical"
+# - and a fourth was it demanding to be told who the speaker was, while she
+# stood on a stage holding a microphone in front of a laughing audience.
+#
+# Shared so the rule cannot drift between the critic, the repairer and the
+# opening guard, which all judge the same clip from the same transcript.
+# ---------------------------------------------------------------------------
+
+WHAT_YOU_ARE_JUDGING = """
+WHAT YOU ARE ACTUALLY LOOKING AT:
+
+This transcript was produced by automatic speech recognition. The viewer will
+never read it — they will WATCH and HEAR the clip. Two consequences, and
+neither is optional:
+
+1. MISRECOGNISED WORDS ARE NOT THE SPEAKER'S WORDS.
+   ASR mishears names, slang, fast speech and code-switched words, and it is
+   worst on exactly the audio that is hardest to transcribe. Words that look
+   invented, misspelled or grammatically impossible are TRANSCRIPTION NOISE.
+   The audience hears the real word and never notices.
+   Judge what the speaker plainly MEANT. Never lower standalone_score or
+   completeness_score because the text is garbled, and never call a clip
+   incoherent when a listener would have followed it perfectly well. If a
+   stretch is so damaged that you cannot tell even roughly what was meant,
+   say so in your reason — but a handful of mangled words inside an otherwise
+   followable passage is a defect in the TRANSCRIPT, not in the clip.
+
+2. THE VIEWER CAN SEE.
+   They see the speaker, their face and their delivery, the setting, and — for
+   a performance — the stage and the audience reacting. Nothing visible needs
+   to be said out loud. Do NOT require the clip to state who the speaker is,
+   what they do for a living, their name, where they are, that an audience is
+   present, or that this is a comedy set, a lecture or an interview.
+   "Who is this person?" is NEVER a missing-context failure.
+
+   This does not relax anything for what the viewer CANNOT see. A pronoun with
+   no antecedent — "she told me...", "that's why he did it", "this is the
+   thing I mentioned" — is still a failure, because no picture tells the
+   viewer who or what is meant. The distinction is simple: the SPEAKER and
+   their surroundings are visible; everyone and everything they refer to is
+   not.
+"""
+
+
 MULTILINGUAL_RULES = """
 LANGUAGE RULES (identical standards in every language):
 
@@ -487,8 +591,7 @@ IDEAL CLIP:
 - contains useful, interesting, surprising, emotional, educational, funny,
   insightful, or strongly opinionated material
 - uses the shortest range that preserves the complete idea
-- preferably about 25-60 seconds
-- hard allowable range is 15-90 seconds
+{duration_rule}
 
 VERY IMPORTANT BOUNDARY RULES:
 
@@ -569,6 +672,182 @@ TRANSCRIPT:
 
 Return candidates only from the supplied sentence IDs.
 """
+
+
+# ---------------------------------------------------------------------------
+# Over-long candidate repair
+# ---------------------------------------------------------------------------
+#
+# The Candidate Finder is asked for complete ideas, and a complete idea is
+# sometimes longer than a Short. The old code simply dropped those proposals:
+# on the Hinglish run that discarded 3 of 4 (110.9s, 95.3s, 117.2s) and left
+# the critic a single candidate to judge. But a 110-second idea very often
+# CONTAINS a complete 60-second one, and the model that proposed it is the
+# cheapest thing that can find it.
+#
+# The repair is strictly a narrowing: it may only return sentence IDs from
+# inside the original proposal, and the result is re-validated locally against
+# the real sentence timestamps. No clamping, no arbitrary word trimming, no
+# invented times — the boundaries stay on sentence units exactly like every
+# other boundary in this pipeline.
+
+OVERLONG_REPAIR_PROMPT = """
+A proposed short-form clip is TOO LONG to publish. Your job is to find the best
+COMPLETE, SELF-CONTAINED SHORTER SECTION inside it — or to say that none exists.
+
+You may ONLY choose from the sentence IDs listed below.
+You may NOT choose anything outside this range.
+You may NOT cut inside a sentence.
+You may NOT invent timestamps.
+
+The section you return MUST:
+- last between {minimum_seconds:.0f} and {maximum_seconds:.0f} seconds
+- make complete sense to someone who never watched the source video
+- begin where the setup that section needs actually begins
+- end after its own payoff, punchline, conclusion, answer or result
+- contain ONE coherent idea, story or bit
+- be the SHORTEST version that still preserves the whole meaning
+
+Do NOT return a section that merely starts well and stops mid-thought just to
+fit the time limit. An incomplete section is worse than no section.
+
+If the material only works as a whole, or every shorter section would be
+missing its setup or its ending, return action REJECT.
+
+{multilingual_rules}
+
+TOPIC OF THE ORIGINAL PROPOSAL:
+{topic}
+
+ORIGINAL PROPOSAL: {original_start} -> {original_end} ({original_duration:.1f} seconds)
+
+SENTENCES YOU MAY CHOOSE FROM:
+
+{transcript}
+"""
+
+
+def _repair_schema():
+    from pydantic import BaseModel
+    from typing import Literal, Optional as TypingOptional
+
+    class OverlongRepair(BaseModel):
+        action: Literal["REPAIR", "REJECT"]
+        new_start_sentence: TypingOptional[str] = None
+        new_end_sentence: TypingOptional[str] = None
+        reason: str = ""
+
+    return OverlongRepair
+
+
+def repair_overlong_candidate(
+    sentences: List[Dict[str, Any]],
+    start_id: str,
+    end_id: str,
+    topic: str = "",
+    client: Any = None,
+    model_name: Optional[str] = None,
+    minimum_seconds: float = MIN_CLIP_SECONDS,
+    maximum_seconds: float = MAX_CLIP_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Narrow an over-long proposal to a complete section, or return None.
+
+    Everything the model returns is verified here against the real sentence
+    list: the IDs must exist, must lie INSIDE the original proposal, must be in
+    order, and the resulting duration must land in the allowed band. A model
+    that ignores any of that is treated as a rejection, never trusted.
+    """
+    if os.environ.get("MEANINGFUL_REPAIR_OVERLONG", "1").strip() == "0":
+        return None
+
+    index_by_id = {str(s.get("id")): i for i, s in enumerate(sentences)}
+    if start_id not in index_by_id or end_id not in index_by_id:
+        return None
+
+    first = index_by_id[start_id]
+    last = index_by_id[end_id]
+    if last <= first:
+        return None
+
+    window = sentences[first:last + 1]
+    original_duration = float(window[-1]["end"]) - float(window[0]["start"])
+
+    # Nothing to narrow into: even the whole range is shorter than the floor.
+    if original_duration <= maximum_seconds:
+        return None
+
+    from google.genai import types as genai_types
+
+    if client is None:
+        from google import genai
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        client = genai.Client(api_key=api_key)
+
+    schema = _repair_schema()
+    prompt = OVERLONG_REPAIR_PROMPT.format(
+        minimum_seconds=minimum_seconds,
+        maximum_seconds=maximum_seconds,
+        multilingual_rules=MULTILINGUAL_RULES,
+        topic=topic or "(not given)",
+        original_start=start_id,
+        original_end=end_id,
+        original_duration=original_duration,
+        transcript=format_sentences_for_ai(window),
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model_name or os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite",
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=schema,
+            ),
+        )
+    except Exception as exc:
+        print(f"  Overlong repair unavailable ({type(exc).__name__}: {exc})")
+        return None
+
+    parsed = getattr(response, "parsed", None)
+    if parsed is None:
+        return None
+
+    if str(getattr(parsed, "action", "")).upper() != "REPAIR":
+        return None
+
+    new_start = str(getattr(parsed, "new_start_sentence", "") or "")
+    new_end = str(getattr(parsed, "new_end_sentence", "") or "")
+
+    if new_start not in index_by_id or new_end not in index_by_id:
+        return None
+
+    new_first = index_by_id[new_start]
+    new_last = index_by_id[new_end]
+
+    # Must be a NARROWING of the original range, in order.
+    if not (first <= new_first <= new_last <= last):
+        return None
+    if new_first == first and new_last == last:
+        return None
+
+    selected = sentences[new_first:new_last + 1]
+    duration = float(selected[-1]["end"]) - float(selected[0]["start"])
+
+    if duration < minimum_seconds or duration > maximum_seconds:
+        return None
+
+    return {
+        "start_sentence": new_start,
+        "end_sentence": new_end,
+        "original_start": start_id,
+        "original_end": end_id,
+        "original_duration": round(original_duration, 3),
+        "duration": round(duration, 3),
+        "reason": str(getattr(parsed, "reason", "") or "")[:300],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -674,8 +953,8 @@ def find_candidates_with_gemini(
     language: str = "unknown",
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
-    minimum_seconds: float = 15.0,
-    maximum_seconds: float = 90.0,
+    minimum_seconds: float = MIN_CLIP_SECONDS,
+    maximum_seconds: float = MAX_CLIP_SECONDS,
 ) -> List[Dict[str, Any]]:
     """
     AI PASS #1.
@@ -774,6 +1053,7 @@ def find_candidates_with_gemini(
         prompt = CANDIDATE_FINDER_PROMPT.format(
             language=language,
             multilingual_rules=MULTILINGUAL_RULES,
+            duration_rule=duration_rule_text(),
             window_id=window["id"],
             transcript=transcript_text,
         )
@@ -877,11 +1157,46 @@ def find_candidates_with_gemini(
                 continue
 
             if duration > maximum_seconds:
-                print(
-                    f"  Rejected {start_id}->{end_id}: "
-                    f"{duration:.1f}s exceeds 90s"
+                # An over-long proposal is not noise: the model found a real
+                # idea and drew the boundaries too wide. Throwing it away threw
+                # away the window's only candidate three times out of four on
+                # the Hinglish run, so ask for the shortest complete
+                # SUBSECTION of that same range before giving up.
+                repaired = repair_overlong_candidate(
+                    sentences=sentences,
+                    start_id=start_id,
+                    end_id=end_id,
+                    topic=str(candidate.get("topic") or ""),
+                    client=client,
+                    model_name=model_name,
+                    minimum_seconds=minimum_seconds,
+                    maximum_seconds=maximum_seconds,
                 )
-                continue
+                if repaired is None:
+                    print(
+                        f"  Rejected {start_id}->{end_id}: "
+                        f"{duration:.1f}s exceeds {maximum_seconds:.0f}s and no "
+                        f"complete shorter section exists inside it"
+                    )
+                    continue
+
+                start_id, end_id = repaired["start_sentence"], repaired["end_sentence"]
+                start_index = sentence_index[start_id]
+                end_index = sentence_index[end_id]
+                selected = sentences[start_index:end_index + 1]
+                start_time = float(selected[0]["start"])
+                end_time = float(selected[-1]["end"])
+                repaired_duration = end_time - start_time
+                print(
+                    f"  Repaired {repaired['original_start']}->"
+                    f"{repaired['original_end']} ({duration:.1f}s) into "
+                    f"{start_id}->{end_id} ({repaired_duration:.1f}s)"
+                )
+                duration = repaired_duration
+                candidate = dict(candidate)
+                candidate["start_sentence"] = start_id
+                candidate["end_sentence"] = end_id
+                candidate["overlong_repair"] = repaired
 
             candidate = dict(candidate)
 

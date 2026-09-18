@@ -28,11 +28,15 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from meaningful_selector import MULTILINGUAL_RULES
+from meaningful_selector import (
+    MULTILINGUAL_RULES,
+    WHAT_YOU_ARE_JUDGING,
+    MAX_CLIP_SECONDS,
+    MIN_CLIP_SECONDS,
+)
 
 
 DEFAULT_MODEL = os.environ.get("MEANINGFUL_OPENING_MODEL", "gemini-3.1-flash-lite")
-MAX_CLIP_SECONDS = 90.0
 MAX_CONTEXT_SENTENCES = 8
 OPENING_SENTENCE_COUNT = 3
 
@@ -292,6 +296,7 @@ opening. The viewer should not need to wait for missing setup to be reconstructe
 
 Return PASS only when the opening is independently understandable.
 
+{WHAT_YOU_ARE_JUDGING}
 {MULTILINGUAL_RULES}
 
 OPENING:
@@ -329,7 +334,7 @@ def _eligible_repair_starts(
         duration = _range_duration(by_id, sid, end_id)
         if duration is None:
             continue
-        if 15.0 <= duration <= MAX_CLIP_SECONDS:
+        if MIN_CLIP_SECONDS <= duration <= MAX_CLIP_SECONDS:
             eligible.append(sentences[i])
 
     return eligible
@@ -365,7 +370,11 @@ def repair_opening_start(
         return OpeningRepairDecision(
             action="REJECT",
             new_start_sentence=None,
-            reason="No earlier sentence can repair the opening while keeping the clip within 15-90 seconds.",
+            reason=(
+                "No earlier sentence can repair the opening while "
+                f"keeping the clip within {MIN_CLIP_SECONDS:.0f}-"
+                f"{MAX_CLIP_SECONDS:.0f} seconds."
+            ),
         )
 
     # Show all allowed earlier starts plus enough current material to understand
@@ -411,6 +420,7 @@ Rules:
    understandable, return REJECT.
 8. This is semantic repair. Do not decide based on any blacklist of words.
 
+{WHAT_YOU_ARE_JUDGING}
 {MULTILINGUAL_RULES}
 
 Return REPAIR with the chosen sentence ID, or REJECT.
@@ -551,10 +561,11 @@ def enforce_opening_independence(
 
         if (
             repaired_duration is None
-            or repaired_duration < 15.0
+            or repaired_duration < MIN_CLIP_SECONDS
             or repaired_duration > MAX_CLIP_SECONDS
         ):
-            print("    Opening repair: REJECT - repaired duration outside 15-90s")
+            print(f"    Opening repair: REJECT - repaired duration outside "
+                  f"{MIN_CLIP_SECONDS:.0f}-{MAX_CLIP_SECONDS:.0f}s")
             review["decision"] = "REJECT"
             review["opening_guard"] = {
                 "status": "REJECT",

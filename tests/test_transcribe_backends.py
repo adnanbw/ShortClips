@@ -143,7 +143,8 @@ def test_transcribe_media_falls_back_on_parakeet_exception(monkeypatch):
     monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
     monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
     monkeypatch.setattr(tb, "_transcribe_with_parakeet", boom)
-    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    monkeypatch.setattr(tb, "_transcribe_with_whisper",
+                        lambda path, **kwargs: sentinel)
     assert tb.transcribe_media("video.mp4") is sentinel
 
 
@@ -154,7 +155,8 @@ def test_transcribe_media_default_is_whisper(monkeypatch):
     monkeypatch.setattr(
         tb, "_transcribe_with_parakeet",
         lambda path: (_ for _ in ()).throw(AssertionError("should not run")))
-    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    monkeypatch.setattr(tb, "_transcribe_with_whisper",
+                        lambda path, **kwargs: sentinel)
     assert tb.transcribe_media("video.mp4") is sentinel
 
 

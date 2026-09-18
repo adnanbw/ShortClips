@@ -13,7 +13,7 @@ Flow:
 
 Rules:
 - No minimum clip count.
-- Hard duration range: 15-90 seconds.
+- Hard duration range: MIN_CLIP_SECONDS-MAX_CLIP_SECONDS.
 - Exact sentence timestamps; no arbitrary padding.
 - No silent fallback to the legacy selector.
 """
@@ -26,7 +26,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from meaningful_selector import build_sentence_units, find_candidates_with_gemini
+import asr_semantic
+from meaningful_selector import (
+    MAX_CLIP_SECONDS,
+    MIN_CLIP_SECONDS,
+    build_sentence_units,
+    find_candidates_with_gemini,
+)
 from meaningful_critic import review_candidates_with_gemini
 from meaningful_opening_guard import enforce_opening_independence
 from meaningful_metadata import calculate_final_rank_score, generate_metadata_with_gemini
@@ -114,6 +120,53 @@ def _meaningful_min_rank() -> float:
         return 0.0
 
 
+def _always_produce() -> bool:
+    return os.environ.get("MEANINGFUL_ALWAYS_PRODUCE", "1").strip() != "0"
+
+
+def _fallback_max() -> int:
+    try:
+        return max(1, int(os.environ.get("MEANINGFUL_FALLBACK_MAX", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _best_effort(reviews: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The least-bad candidates, for when the critic approved nothing.
+
+    Four judges run in series here — finder, duration gate, critic, opening
+    guard — and every one of them can return an empty list, at which point the
+    job dies with "Clip detection failed - the AI model did not return usable
+    clips". On a real Hinglish video that message was simply false: the model
+    returned four candidates, all four contained a real joke, and they were
+    discarded for boundary problems and for the transcript's spelling.
+
+    A user can delete a mediocre clip. They can do nothing at all with an
+    error, and they cannot tell from it whether the video was unsuitable or
+    the tool failed. So when nothing clears the bar, the best of what was
+    actually found is published and flagged, rather than nothing.
+    """
+    scored: List[Dict[str, Any]] = []
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        verification = (review.get("final_verification")
+                        or review.get("initial_verification") or {})
+        try:
+            score = (float(verification.get("standalone_score") or 0.0)
+                     + float(verification.get("completeness_score") or 0.0)) / 2.0
+        except (TypeError, ValueError):
+            score = 0.0
+        item = dict(review)
+        item["semantic_rank_score"] = round(score, 3)
+        item["low_confidence"] = True
+        scored.append(item)
+
+    scored.sort(key=lambda x: float(x.get("semantic_rank_score") or 0.0),
+                reverse=True)
+    return scored[:_fallback_max()]
+
+
 def _rank_approved(reviews: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep ACCEPT/REPAIR results, compute semantic rank, sort, then cap."""
     approved: List[Dict[str, Any]] = []
@@ -166,7 +219,7 @@ def _validate_short_times(
     shorts: List[Dict[str, Any]],
     video_duration: float,
 ) -> List[Dict[str, Any]]:
-    """Clamp timestamps and enforce the hard 15-90 second duration rule."""
+    """Clamp timestamps and enforce the hard duration band."""
     valid: List[Dict[str, Any]] = []
 
     try:
@@ -197,7 +250,7 @@ def _validate_short_times(
         if clip_duration < 15.0:
             print(f"Rejected final clip {index}: {clip_duration:.1f}s is too short")
             continue
-        if clip_duration > 90.0:
+        if clip_duration > MAX_CLIP_SECONDS:
             print(f"Rejected final clip {index}: {clip_duration:.1f}s exceeds 90s")
             continue
 
@@ -221,6 +274,46 @@ def _validate_short_times(
     )
 
     return valid
+
+
+def _flag_unreliable_candidates(
+    candidates: List[Dict[str, Any]],
+    unreliable: List[Any],
+) -> List[Dict[str, Any]]:
+    """Annotate candidates that overlap poorly-read speech. Never drop one.
+
+    This used to delete any candidate with more than 20% of its runtime inside
+    an examined-and-BAD stretch. On the video this was built for that removed
+    proposals the critic had not yet seen, on the word of a reader that had
+    sampled 25-second windows — and the pipeline then reported "no usable
+    semantic candidates", which is a different failure from the real one.
+
+    The overlap is still recorded, because it is genuinely useful when reading
+    the debug JSON to understand why the critic rejected something.
+    """
+    if not unreliable:
+        return candidates
+
+    flagged: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            start = float(candidate.get("start"))
+            end = float(candidate.get("end"))
+        except (TypeError, ValueError):
+            flagged.append(candidate)
+            continue
+
+        bad = asr_semantic.overlap_seconds(start, end, unreliable)
+        if bad > 0:
+            candidate = dict(candidate)
+            candidate["unreliable_overlap_seconds"] = round(bad, 2)
+        flagged.append(candidate)
+
+    overlapping = sum(1 for c in flagged if c.get("unreliable_overlap_seconds"))
+    if overlapping:
+        print(f"{overlapping} of {len(flagged)} candidate(s) overlap speech "
+              f"the language check read poorly; kept for the critic to judge.")
+    return flagged
 
 
 def get_meaningful_clips(
@@ -254,6 +347,19 @@ def get_meaningful_clips(
     print("=" * 72)
     print(f"Transcript language: {language}")
 
+    # A PARTIAL transcript reads poorly in places. That is REPORTED, not acted
+    # on: the reader samples 25-second windows, which is fair evidence about a
+    # transcript and weak evidence about any one candidate, and the Blind
+    # Context Critic below already reads each candidate in full and rejects the
+    # incoherent ones. Dropping candidates here as well meant a rough Hinglish
+    # transcript lost most of its proposals before the critic ever ran.
+    quality = (transcript_result.get("asr") or {}).get("quality") or {}
+    semantic = quality.get("semantic") or {}
+    unreliable = asr_semantic.unreliable_ranges(semantic)
+    if quality.get("status") == "PARTIAL":
+        print(f"Transcript status: PARTIAL — {len(unreliable)} stretch(es) "
+              f"read poorly; the critic will judge candidates on their own.")
+
     # --------------------------------------------------------------
     # Sentence normalization
     # --------------------------------------------------------------
@@ -283,6 +389,8 @@ def get_meaningful_clips(
 
     _save_json(output_dir, "pipeline_candidates.json", candidates)
     print(f"Candidate Finder kept {len(candidates)} candidate(s).")
+
+    candidates = _flag_unreliable_candidates(candidates, unreliable)
 
     if not candidates:
         print("⚠️ Candidate Finder returned no usable semantic candidates.")
@@ -339,6 +447,20 @@ def get_meaningful_clips(
         f"{len(approved)} survived final quality ranking."
     )
 
+    if not approved and _always_produce():
+        approved = _best_effort(guarded_results)
+        if approved:
+            print(
+                f"⚠️ No candidate cleared the quality bar. Publishing the "
+                f"{len(approved)} best of {len(guarded_results)} reviewed "
+                f"instead of failing the job - they are flagged "
+                f"low_confidence."
+            )
+            for item in approved:
+                print(f"   {item.get('candidate_id', 'candidate')}: "
+                      f"score {item.get('semantic_rank_score')}")
+            _save_json(output_dir, "pipeline_final_candidates.json", approved)
+
     if not approved:
         print("⚠️ No candidate passed standalone/completeness/opening verification.")
         return None
@@ -371,7 +493,8 @@ def get_meaningful_clips(
     shorts = _validate_short_times(shorts, video_duration=video_duration)
 
     if not shorts:
-        print("⚠️ Grounded Metadata produced no valid 15-90s final clips.")
+        print(f"⚠️ Grounded Metadata produced no valid "
+              f"{MIN_CLIP_SECONDS:.0f}-{MAX_CLIP_SECONDS:.0f}s final clips.")
         return None
 
     result = {

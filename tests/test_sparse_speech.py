@@ -47,3 +47,40 @@ class TestEdges:
     def test_zero_duration_does_not_divide_by_zero(self):
         assert main.speech_is_sparse(_t("hi"), 0)
         assert not main.speech_is_sparse(_t(*["a b c d e f g h i j"] * 3), 0)
+
+
+class TestFailureMessageNamesTheRightStage:
+    """A job that produces no clips must say WHY.
+
+    "Clip detection failed — the AI model did not return usable clips" was
+    printed for a video whose transcript was a third invented: the selector had
+    behaved correctly on input it could not use, and the message blamed it.
+    """
+
+    def _transcript(self, status=None):
+        transcript = _t("hello there everyone welcome back to the show")
+        if status:
+            transcript["asr"] = {"quality": {"status": status}}
+        return transcript
+
+    def test_a_partial_transcript_is_reported_as_a_transcription_problem(self):
+        message = main.clip_failure_message(self._transcript("PARTIAL"))
+        assert "Transcription quality was too low" in message
+        assert "did not return usable clips" not in message
+
+    def test_a_bad_transcript_is_reported_the_same_way(self):
+        assert "Transcription quality was too low" in             main.clip_failure_message(self._transcript("BAD"))
+
+    def test_a_good_transcript_still_reports_a_clip_detection_failure(self):
+        # Genuinely no clip-shaped material: the old message is the right one.
+        message = main.clip_failure_message(self._transcript("GOOD"))
+        assert message == main.NO_CLIPS_MESSAGE
+
+    def test_a_transcript_with_no_diagnostics_keeps_the_old_message(self):
+        assert main.clip_failure_message(self._transcript()) == main.NO_CLIPS_MESSAGE
+        assert main.clip_failure_message(None) == main.NO_CLIPS_MESSAGE
+        assert main.clip_failure_message({}) == main.NO_CLIPS_MESSAGE
+
+    def test_the_transcription_message_is_the_shared_one(self):
+        from asr_quality import TranscriptQualityError
+        assert main.clip_failure_message(self._transcript("BAD")) ==             TranscriptQualityError.USER_MESSAGE

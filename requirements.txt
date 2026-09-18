@@ -18,3 +18,7 @@ python-multipart==0.0.27
 httpx==0.28.1
 Pillow==12.2.0
 beautifulsoup4==4.14.3
+# Optional ASR accelerator: dispatches transcription to a Kaggle GPU kernel
+# (kaggle_worker.py). Never required — without credentials the job transcribes
+# locally exactly as before.
+kaggle==2.2.4

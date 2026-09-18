@@ -16,7 +16,11 @@ already computes and throws away (``avg_logprob``, ``no_speech_prob``,
 work for any language, and returns
 
     {"status": "GOOD" | "RETRY" | "BAD", "score": 0-100,
-     "reasons": [...], "metrics": {...}}
+     "reasons": [...], "metrics": {...}, "uncertain": bool}
+
+``asr_semantic`` may later fold a reading of the actual words into that verdict
+and turn it into PARTIAL or BAD; this module never produces PARTIAL itself,
+because deciding that half a transcript is real requires reading it.
 
 Design rules (these are requirements, not preferences)
 ------------------------------------------------------
@@ -464,7 +468,11 @@ def good_score_threshold() -> float:
 #: Ordering of the verdicts, best first. Used to pick between two attempts:
 #: the STATUS decides before the score does, because a status can be changed
 #: by the language check while the structural score stays high.
-STATUS_RANK = {"GOOD": 2, "RETRY": 1, "BAD": 0}
+#:
+#: PARTIAL outranks RETRY on purpose. PARTIAL means someone read the transcript
+#: and found real speech in identified places; RETRY means structure was
+#: suspicious and nobody has read it. Known-half-good beats unknown.
+STATUS_RANK = {"GOOD": 3, "PARTIAL": 2, "RETRY": 1, "BAD": 0}
 
 
 def rank_quality(quality: Optional[Dict[str, Any]]) -> Tuple[int, float]:
@@ -549,93 +557,8 @@ def quality_reason_lines(quality: Dict[str, Any], limit: int = 4) -> List[str]:
             for index, reason in enumerate(reasons[:limit])]
 
 
-# --- optional second opinion ------------------------------------------------
-
-_GEMINI_CHECK_PROMPT = """You are checking whether a machine transcript is
-usable, NOT whether the speech is interesting.
-
-The transcript may be in ANY language, and may freely mix languages and scripts
-within a sentence (for example Hindi written in Devanagari mixed with English
-words). Code-switching like that is NORMAL SPEECH and must be judged USABLE.
-Never mark a transcript unusable for being in a language you did not expect,
-for switching language mid-sentence, or for informal or regional wording.
-
-Mark it UNUSABLE when the text is not real language: words that do not exist in
-the language they are written in, phonetic gibberish that merely LOOKS like the
-script, fragments of unrelated languages strung together, endlessly repeated
-phrases, or strings no human would have said.
-
-The important case: a weak speech model transcribing a language it cannot
-handle produces fluent-looking text made of INVENTED words. Read the sample as
-a native speaker would and say whether these are actual words forming actual
-sentences.
-
-TRANSCRIPT SAMPLE:
-
-{sample}
-"""
-
-
-def language_check_mode() -> str:
-    """'auto' (default) | '1' (always) | '0' (never).
-
-    'auto' asks a reader ONLY when the deterministic signals cannot decide —
-    the grey band of DEFAULT_LOGPROB_SUSPECT, plus the last reprieve before a
-    job is refused. A clean transcript never reaches it, so the normal job pays
-    nothing; both cases that do reach it were going to be wrong otherwise.
-    """
-    raw = os.environ.get("ASR_QUALITY_GEMINI", "auto").strip().lower()
-    return raw if raw in ("0", "1", "auto") else "auto"
-
-
-def gemini_second_opinion(transcript: Dict[str, Any],
-                          api_key: Optional[str] = None,
-                          model_name: Optional[str] = None) -> Optional[bool]:
-    """Is this text real language? True/False, or None when unavailable.
-
-    Deterministic signals measure structure: repetition, timing, speech rate,
-    the decoder's confidence. None of them can tell an invented Devanagari word
-    from a real one, which is exactly how the Hinglish job produced a
-    structurally perfect transcript of nothing. This is the only check that can,
-    and it is called only when structure has already run out of answers.
-    """
-    if language_check_mode() == "0":
-        return None
-
-    api_key = api_key or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return None
-
-    text = str(transcript.get("text") or "")
-    if len(text) < 80:
-        return None
-    sample = text[:1500] + ("\n…\n" + text[-1500:] if len(text) > 3500 else "")
-
-    try:
-        from google import genai
-        from google.genai import types as genai_types
-        from pydantic import BaseModel
-
-        class _Verdict(BaseModel):
-            usable: bool
-            explanation: str
-
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
-            contents=_GEMINI_CHECK_PROMPT.format(sample=sample),
-            config=genai_types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=_Verdict,
-            ),
-        )
-        parsed = getattr(response, "parsed", None)
-        if parsed is None:
-            return None
-        print(f"🧪 Gemini transcript check: "
-              f"{'usable' if parsed.usable else 'unusable'} — {parsed.explanation}")
-        return bool(parsed.usable)
-    except Exception as exc:  # never let the optional check fail a job
-        print(f"⚠️ Transcript sanity check unavailable ({type(exc).__name__}: {exc})")
-        return None
+# --- reading the words -------------------------------------------------------
+# The semantic check lives in ``asr_semantic``: it samples across the whole
+# timeline and returns per-region verdicts, which is what this module cannot do
+# because it does not read. ``_is_uncertain`` above is the hand-off — it says
+# "structure has run out of answers here", and asr_semantic decides the rest.

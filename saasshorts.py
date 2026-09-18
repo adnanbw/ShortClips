@@ -1072,6 +1072,13 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
     """
     Transcribe audio with word-level timestamps via the configured ASR backend.
     Returns list of {"word": str, "start": float, "end": float}.
+
+    DELIBERATELY the RAW single-pass path. SaaSShorts generates its own
+    narration with a TTS voice and then transcribes that audio purely to get
+    word timings for the on-screen captions: the words are already known, the
+    audio is synthetic, and there is no clip selection downstream to protect.
+    Routing this through transcribe_media_checked would add a quality gate with
+    nothing to catch and a retry with nothing to fix.
     """
     from transcribe_backends import transcribe_media
 

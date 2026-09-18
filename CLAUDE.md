@@ -140,23 +140,218 @@ to **throw away** — `avg_logprob`, `no_speech_prob`, `compression_ratio`,
 `language_probability` — plus language-independent structural signals
 (repetition and n-gram loops, speech rate, timestamp sanity, missing word
 timestamps, junk fragments). Verdict: `GOOD` / `RETRY` / `BAD`.
-`transcribe_media_checked()` then retries **once** with `WHISPER_RETRY_MODEL`
-(default `large-v3-turbo`) and keeps whichever attempt scored better;
-`BAD` twice raises `TranscriptQualityError`, so the user is told the audio
-could not be transcribed instead of that no clips were found.
-Debug: `meaningful_debug/asr_{initial,retry}.json` and `asr_quality_*.json`.
+`transcribe_media_checked()` runs **one probe, one pass, one repair**:
+`_probe_best_model` decodes ~75 seconds (three 25s slices spread across the
+timeline, via faster-whisper's own `clip_timestamps`) and upgrades to
+`WHISPER_RETRY_MODEL` when the base model comes back non-GOOD *or* merely
+`uncertain`; the video is then transcribed once with whatever that chose; only
+a `BAD` result is transcribed again, once. `BAD` twice raises
+`TranscriptQualityError`, so the user is told the audio could not be
+transcribed instead of that no clips were found.
+Debug: `meaningful_debug/asr_{initial,retry}.json` and `asr_quality_*.json`;
+`tools/validate_asr_semantic.py output/<job>` replays a job's saved transcript
+through semantic validation, sentence units, the Candidate Finder, the
+over-long repair, the critic and the opening guard **without re-transcribing
+or rendering anything** — which is how a failing video should be investigated
+before any GPU time is spent on it.
 
 Deterministic signals measure **structure**, and that is not enough on its
-own: whisper-`small` transcribed this very video as fluent Devanagari-shaped
-**nonsense** — no repetition, valid timestamps, 173 words/min, one clean script
-pair — and scored 87/100. Nothing measurable separates an invented word from a
-real one, so when a GOOD verdict rests on structure alone (`avg_logprob` below
-`ASR_QUALITY_LOGPROB_SUSPECT`, -0.60; clean transcripts in any language sit at
--0.25..-0.45) the verdict is marked `uncertain` and one small Gemini call reads
-the words. It condemned the real transcript ("phonetic gibberish, non-existent
-words") and cleared a real English one, and a clean job never reaches it —
-that is what `ASR_QUALITY_GEMINI=auto` buys for ~nothing. An unavailable check
-never fails a job on suspicion alone.
+own. Two measured failures, one after the other:
+
+1. whisper-`small` transcribed this video as fluent Devanagari-shaped
+   **nonsense** — no repetition, valid timestamps, 173 words/min — and it
+   scored 87/100.
+2. The retry, `large-v3-turbo` at `avg_logprob` **-0.29** and a structural
+   score of **100/100**, was still a third invented. Nothing about it was
+   `uncertain`, so the reader was never called and the clip selector got it
+   as GOOD.
+
+So the reader (`asr_semantic.py`) is not gated on decoder confidence alone.
+It samples ~6 windows spread across the WHOLE timeline — anchored on segments,
+not character offsets, because the corruption in the real job lived in the
+MIDDLE, exactly where a first/last-1500-characters sample never looks — labels
+them in ONE structured call, and returns a per-region verdict plus
+`GOOD` / `PARTIAL` / `BAD`. **A retry caused by a semantic failure is always
+read again**, however confident the decoder is: the retry has to prove it
+fixed the thing it was run for. `ASR_QUALITY_GEMINI` is honoured literally —
+`0` never, `auto` only when justified, `1` every attempt — and a clean video
+in `auto` costs zero reads. An unavailable reader is never a guilty verdict.
+
+**The reader is advisory. `PARTIAL` is an ACCEPT.** This is the correction to
+the original design, and it was measured on the same stand-up
+(`Qd4jGgu06dw`). A transcript does not have to be *correct* to locate a moment
+in a video — it has to be good enough to find the words, which is why the
+upstream tool, with no quality gate whatsoever, cuts this video fine. Worse,
+on genuinely code-switched speech `GOOD` is close to unreachable by
+construction: `aggregate()` needs 80% of sampled seconds GOOD, while the
+reader marks a whole 25-second window PARTIAL for one oddly-spelled word —
+and correct phonetic Devanagari for a code-switched English word
+(`प्रवल्म` = "problem", `संसिटिव` = "sensitive") reads as exactly that. So
+every Hinglish video escalated to the end of the ladder whatever the models
+produced, and its last rung was OOM-killed. Only `BAD` — nothing usable in
+there at all — is now a refusal; a structural `RETRY` still earns the one
+repair pass, then is used.
+
+Two things that used to act on a `PARTIAL` verdict are gone: the **dense**
+second reader pass over the whole timeline, and
+`meaningful_pipeline._drop_unreliable_candidates`, which deleted any candidate
+with more than 20% of its runtime inside a BAD region. A sample of 25-second
+windows is fair evidence about a *transcript* and weak evidence about any one
+*clip*, and the Blind Context Critic already reads every candidate in full —
+so that filter removed proposals from a rough transcript before the judge that
+could actually assess them ever ran, and the pipeline then reported "no usable
+semantic candidates", which is a different failure from the real one.
+`_flag_unreliable_candidates` records the overlap for the debug JSON and drops
+nothing. Silence about a stretch still means "not examined", never "fine" and
+never "bad".
+
+**Transcription never loops.** There used to be an escalation ladder —
+`small` → `large-v3-turbo` → `large-v3`, each rung re-transcribing the WHOLE
+video, walked until something came back GOOD. On a 9.5-minute Hinglish upload
+that was ~16 minutes of CPU per pass; the third model load was OOM-killed
+(`exit code -9`) with turbo still resident, and the job delivered nothing
+after ~50 minutes. `subtitles.whisper_model_ladder` now returns at most one
+model, and `_get_whisper_model` evicts before allocating
+(`WHISPER_MODEL_CACHE` defaults to **1**) so two large models are never
+resident at once.
+
+The probe is what replaced the extra rungs, and it is a **quality** decision,
+not a language one — there is still no list of languages that get the big
+model. The signal that makes it work is `uncertain` (`avg_logprob` below
+-0.60): whisper-`small`'s full transcript of that video scored **77.8/GOOD**
+while being a fifth invented, so status alone would have kept it, but the
+decoder's own confidence said it was guessing — and that flag is available
+after 75 seconds just as well as after 17 minutes. The probe's language is
+pinned onto the upgraded pass for the same reason `_retry_language` exists.
+
+`large-v3` is no longer wired in, though it does measurably rescue audio turbo
+mangles — on the 36 seconds of the real stand-up turbo made the biggest mess
+of:
+
+| | avg_logprob | reader |
+|---|---|---|
+| `large-v3-turbo` | -0.944 | BAD 10 (phonetic gibberish) |
+| `large-v3` | **-0.187** | PARTIAL 60 (intelligible; the bit's punchline survives) |
+
+Across three sampled slices that took the transcript from 30% BAD to **0%**
+BAD. It costs ~1.8x turbo's decode time on CPU and was the pass that got
+OOM-killed, so it is available as `WHISPER_RETRY_MODEL=large-v3` for a
+deployment with the RAM, and is not a third automatic attempt.
+`tools/compare_asr_models.py` is how that was measured — it decodes short
+slices straight out of a source with `clip_timestamps` (no ffmpeg, nothing cut
+to disk) and has the pipeline's own reader grade each one, so the same
+question can be re-asked before any future model change.
+
+### Judges rank clips; they do not end the job
+
+Measured on two real runs of the same pipeline. An English stand-up set
+(`Vy96iuq94Ko`) scored **95-100** on six of seven candidates and produced six
+clips. A Hinglish one (`Qd4jGgu06dw`) scored 80/40, 30/40, 30/20 and 60/30 —
+four candidates that each contained a real joke — and the job died with
+"Clip detection failed — the AI model did not return usable clips for this
+video", which is simply false: the model returned four.
+
+Four judges run in series (Candidate Finder, duration gate, Blind Context
+Critic, Opening Independence Guard) and **every one of them could return an
+empty list**, at which point `get_meaningful_clips` returns None and `main.py`
+raises. Three changes, all the same shape — a gate that should have been a
+preference:
+
+- **The critic has a shipping tier.** Its only path through was `verdict ==
+  PASS` + four booleans + **85 on BOTH** standalone and completeness, on a
+  scale whose own prompt says "90+ should mean genuinely excellent". That is
+  near-excellence demanded twice of every clip.
+  `meaningful_critic.accept_floor()` (`MEANINGFUL_ACCEPT_FLOOR`, default 70)
+  is the real quality question — is this worth publishing — and everything
+  between the two is decided by RANK, which is what a score is for.
+  `strict_pass` still exists and still means flawless; it just no longer means
+  "or delete it".
+- **A repair that made a clip worse is discarded.** The repaired verification
+  replaced the original unconditionally, so on the real job a 60/30 candidate
+  was "repaired" to 30/20 and the repair stage turned a borderline clip into a
+  certain rejection (`_is_worse`, which also restores `final_range` — not just
+  the sentence IDs, or the record keeps the repaired timestamps).
+- **`meaningful_pipeline._best_effort` is the floor.** When nothing clears the
+  bar, the best of what was actually found is published, ranked by the
+  critic's own scores and flagged `low_confidence`, instead of the job
+  failing. A user can delete a mediocre clip; they can do nothing with an
+  error, and cannot tell from it whether the video was unsuitable or the tool
+  broke. `MEANINGFUL_ALWAYS_PRODUCE=0` restores the old behaviour;
+  `MEANINGFUL_FALLBACK_MAX` (3) caps it.
+
+Replaying both jobs' saved verdicts through this: the English run is
+**unchanged** (same six clips, same order) and the Hinglish one publishes three
+instead of nothing.
+
+### The judges are told what they are actually looking at
+
+`meaningful_selector.WHAT_YOU_ARE_JUDGING` is shared by the Blind Context
+Critic, the boundary repairer and both Opening Guard prompts. The critic used
+to open with *"You are seeing EXACTLY AND ONLY what the eventual viewer will
+hear"*, which is false in two ways that each cost real clips:
+
+- **The viewer hears speech, not a transcript of it.** On the Hinglish job
+  three of five rejections were the critic marking a clip down for ASR noise —
+  *"contains significant transcription errors ('पुगली उलूश शुष')"*,
+  *"fragmented, repetitive, and nonsensical"* — about a video in which a
+  comedian tells a joke and an audience laughs. Misrecognised words are a
+  defect in the TRANSCRIPT, not in the clip.
+- **The viewer can see.** A fourth rejection demanded to know who "Sharon"
+  was, while she stood on a stage holding a microphone. The speaker and their
+  surroundings are visible and never need saying aloud.
+
+The second rule is deliberately narrow, or it would gut the Opening Guard: the
+SPEAKER is visible, everyone and everything they refer to is not, so a pronoun
+with no antecedent ("she told me…") is still a failure. The repairer gets the
+block too — it moves boundaries from the critic's failure reason, and would
+otherwise try to repair its way around a garbled stretch.
+
+Measured by replaying both jobs' saved transcripts through the real models
+(`tools/validate_asr_semantic.py`, no re-transcription, no rendering):
+
+| | candidates | critic accepted | survived the guard |
+|---|---|---|---|
+| Hinglish, before | 5 | **0** | 0 (job failed) |
+| Hinglish, after | 5 | **4** at 95/95 | **3** |
+| English, before | 7 | 6 | 6 |
+| English, after | 8 | 8 | **6** (unchanged) |
+
+The critic's own wording afterwards: *"The narrative is easy to follow despite
+some transcription noise."* That is the whole fix.
+
+### Clip duration is a preference, not a gate
+
+`15-90` was hardcoded in 8 enforcement points across 5 files plus 4 prompt
+strings. It is now `MIN_CLIP_SECONDS` / `MAX_CLIP_SECONDS` in
+`meaningful_selector.py` (**15-110**), imported by the critic, the opening
+guard and the pipeline, with `duration_rule_text()` as the single sentence
+every prompt uses — so the rule cannot drift between what is enforced and what
+the model is told.
+
+90s was never a platform limit (YouTube Shorts allows 3 minutes, TikTok 10,
+Reels 3); it was an editorial preference enforced as a gate, and that gate
+threw away the best moment of a real job. The lift bit's punchline landed at
+**107s**, so the only repair that could include it measured 107s, and a bare
+`> 90.0` deleted it — leaving the version cut off mid-sentence, which the
+critic then correctly rejected as incomplete. Every prompt still asks for
+25-60s and says a complete 100-second clip beats a truncated 60-second one.
+
+`build_candidate_windows`'s overlap is tied to `MAX_CLIP_SECONDS` rather than
+written out: the overlap must be at least as long as the longest allowed clip
+or a long moment straddles two windows and is proposable in neither.
+`tests/test_overlong_repair.py` derives its spans from the constant for the
+same reason — it used to hardcode the arithmetic of a 90-second cap, and
+raising the cap silently inverted three of its assertions.
+
+An over-long Candidate Finder proposal is narrowed before it is rejected
+(`meaningful_selector.repair_overlong_candidate`). The old code dropped
+anything over 90s outright, which on this video discarded three of four
+proposals (110.9s, 95.3s, 117.2s) and left the critic a single candidate. The
+repair asks for the shortest COMPLETE section inside that same range and
+re-validates every returned ID locally: it must exist, lie inside the original
+proposal, be in order, and land in the 15-90s band. No clamping, no arbitrary
+word trimming — boundaries stay on sentence units like every other boundary
+here, and "no complete shorter section exists" is still a rejection.
 
 **Quality drives the retry, never the language, and there is no language
 blacklist.** A clean Spanish video costs exactly one pass; a noisy English one
@@ -214,6 +409,185 @@ above the bidi layer. `generate_ass` emits those three runs in visual order for
 an RTL block — the runs, not the words: libass still bidi-orders *inside* a
 run, so reversing the words as well cancels itself out. `\q2` disables
 auto-wrap there, because the flip is only valid for a single visual line.
+
+### Remote transcription on Kaggle (`kaggle_worker.py`, `kaggle-worker/`)
+
+Transcription is the long pole of a job — ~16 minutes of CPU for a 9.5-minute
+video on the dev box — and it is the **only** stage worth moving off the
+machine: its input is a URL and its output is a JSON transcript. The render
+needs the video file and would have to ship gigabytes back, so it stays here.
+
+**Kaggle runs BATCH kernels. There is no endpoint and nothing can call a kernel
+while it runs.** The only interface is: push a version → it queues → it runs →
+poll `kernels_status` → download the output. So `kaggle_worker.transcribe_url`
+is a dispatcher, not a client: it substitutes the job into a copy of
+`kaggle-worker/worker.py` (a **script** kernel, not a notebook, so the source
+stays diffable and runnable by hand), pushes it, polls, and pulls
+`transcript.json` out of the kernel output. Budget 3-8 minutes wall clock,
+dominated by queue wait and kernel boot rather than by the work.
+
+**It is strictly an accelerator and can never fail a job.** Every path —
+no credentials, push rejected, kernel ERROR, timeout, missing output, a
+transcript the quality gate rejects — returns None, and `main.transcribe_video`
+transcribes locally exactly as it did before the module existed. Kaggle's GPU
+quota is weekly, its queue is shared and its egress IP is sometimes blocked by
+YouTube; none of that may take a job down.
+
+The **cache kernel** (`kaggle-worker/cache_builder.py`, pushed by
+`tools/kaggle_setup.py cache`) holds exactly one thing: the ~1.6 GB
+faster-whisper weights, which every job would otherwise pull from HuggingFace.
+The worker lists it in `kernel_sources` and Kaggle mounts its output read-only
+at `/kaggle/input/`. Deliberately a KERNEL output and not a Dataset: a dataset
+would have to be built on the dev machine, i.e. download 1.6 GB at home to
+upload it back to Google.
+
+It deliberately does **not** cache the BgUtils `node_modules`, and that is a
+measured decision. Deno keeps npm packages in its own global cache and only
+symlinks them into `node_modules`, so a copied tree is incomplete and its
+symlinks point at build-time absolute paths — the first attempt got as far as
+starting the token server and died with *"Could not find package 'lru-cache'
+from referrer .../proxy-agent/dist/index.js"*. Doing it properly means shipping
+`DENO_DIR` too and forcing both builds onto identical absolute paths, which is
+a lot of fragility to save the ~1-2 minutes `deno install` actually costs. The
+worker installs it fresh each run.
+
+The repo id behind each model name is **not** written in the cache builder:
+`faster_whisper.download_model` owns that mapping. A copy of it there was
+already wrong once — it said `Systran/faster-whisper-large-v3-turbo` while
+faster-whisper 1.2.1 resolves `large-v3-turbo` to
+`mobiuslabsgmbh/faster-whisper-large-v3-turbo`, and the build died on a 401.
+The download passes `use_auth_token=False`, because a Kaggle image can carry a
+stale `HF_TOKEN` and huggingface_hub then sends it and gets 401 on a public
+repo.
+
+The download recipe in the worker is **measured, not improvised**: mweb plus a
+BgUtils PO token, which fetched a 10-minute video from Kaggle's egress in
+**9.3 s** with no bot-check. Do not simplify it away.
+
+Two contract rules:
+- The worker returns **raw** whisper words; `merge_continuation_words` runs on
+  the backend, so there is exactly one implementation and a remote transcript
+  cannot drift from a local one in how words are joined.
+- A remote transcript clears the **same** gate via
+  `transcribe_backends.judge_remote_transcript` — "it came from the GPU box" is
+  not a quality argument. It returns None instead of raising on BAD, because
+  the caller still has a working local path.
+
+`render_worker` writes the job with **`pprint`, not `json.dumps`** — the
+destination is a Python source file and the two literal syntaxes differ exactly
+where it hurts: `json.dumps(None)` is `null`, `True` is `true`. The first real
+dispatch died 26 seconds into a kernel with `NameError: name 'null' is not
+defined`, and the test meant to prevent it had passed, because `ast.parse`
+checks SYNTAX and `{"language": null}` is perfectly valid Python that fails at
+import. The test now `ast.literal_eval`s the rendered JOB block and compares it
+to the dict that was sent.
+
+It also passes a **function** as the `re.sub` replacement rather than a string:
+a URL is user input, and `re.sub` interprets backslashes in a replacement, so a
+URL containing `
+` or `` would become a literal newline or a group
+reference. Both have tests.
+
+**The language is pinned from a LOCAL probe before dispatch, and that is the
+most important rule of the remote path.** `main.transcribe_video` runs
+`transcribe_backends.probe_language_for_remote` on the copy it already
+downloaded — the same three-slice probe, with the small model — and passes the
+result to `kaggle_worker.transcribe_url(language=...)`. Measured on a real
+Kaggle run: left to detect for itself, large-v3-turbo called the Hindi stand-up
+**English at 90%** and returned a fluent English TRANSLATION of it —
+*"Yesterday, I went to a lift and I went to a couple"* for *"कल में एक लिफ्ट
+में गुसी..."* — although the task is always `transcribe`. It is the same
+failure `_retry_language` exists to stop locally, and the remote path shipped
+without that protection until a test run produced it. Nothing downstream can
+catch it: `judge_remote_transcript` scores it ~99/100 because it is genuinely
+good English, and the clips, captions and metadata all change language behind
+the user's back. Below `ASR_PIN_LANGUAGE_ABOVE` the detection may itself be
+wrong, so the remote model decides after all. The probe costs ~15s of CPU
+against a 16-minute local transcription.
+
+**Fetching the output has two traps, and the second one is the real one.**
+
+The kernel used to leave its BgUtils git clone in `/kaggle/working` —
+`.git/hooks/*.sample`, devcontainer config, `node_modules`, thousands of
+entries — and Kaggle publishes that whole directory as the kernel's output.
+`worker.prune_output()` now leaves only `transcript.json`, `result.json` and
+the token-server log, in BOTH the success and failure paths, so the download is
+three small files rather than a source tree.
+
+The blocker, though, was encoding. `kernels_output` follows its own output
+pages (`while token and page_token is None` — so pass ONE call and never a
+`page_token`, which switches that off) and then writes the kernel log with
+`open(outfile, "w")`, no encoding. On a host whose default codepage is not
+UTF-8 — a Windows dev box, cp1252 — a Devanagari transcript in that log raises
+`UnicodeEncodeError` **after** the data files have been written, in binary, to
+disk. Treating that exception as failure threw away a GPU transcription that
+had already succeeded, twice, while the kernel logs plainly said
+"Transcribed 134 segments in 16.6s (cuda)". `_fetch_transcript` now checks
+whether `transcript.json` exists before believing the exception. The Linux
+container is UTF-8 and never hit this; only the host-side
+`tools/kaggle_setup.py test` did.
+
+Ceiling worth knowing: Kaggle is a batch notebook platform being used as an
+inference API, and ~30 GPU-hours/week will not support the paid product. Modal,
+RunPod, fal and Replicate give a real HTTP endpoint with seconds of latency.
+The seam is `main.transcribe_video(source_url=...)`, so swapping the backend is
+one module.
+
+### The x264 preset is a speed knob, not a quality knob
+
+`ffmpeg_utils.QUALITY` shipped at `-preset medium -crf 18`, and every "burn a
+filter over a finished clip" pass uses it: the hook overlay (`hooks.py`), the
+caption burn (`subtitles.py`), editor effects and `finalize_clip_passthrough`.
+A clip gets at least two of them.
+
+At a fixed CRF the preset trades encoding SPEED against bitrate efficiency —
+CRF is what holds perceptual quality. Measured on a real 55.7s 1080x1920 clip
+out of this pipeline, re-encoding at crf 18:
+
+| preset | time | size | SSIM vs source |
+|---|---|---|---|
+| medium | 144.3s | 28.8 MB | 0.99756 |
+| fast | 115.2s | 30.3 MB | 0.99755 |
+| **veryfast** | **55.0s** | **26.5 MB** | 0.99650 |
+
+2.6x faster, a **smaller** file, and 0.001 of SSIM given up — far less than
+YouTube and TikTok destroy re-encoding the upload. `QUALITY` is now `veryfast`,
+overridable with `FFMPEG_PRESET_QUALITY`. On the two-clip Hinglish job that is
+roughly **180 seconds per clip**.
+
+**This replaced a worse plan.** The obvious target was the three encodes per
+clip — reframe, then hook, then captions — collapsed into one. It is the wrong
+change: those intermediate files are the ADDRESSING SCHEME, not waste.
+`app.py` parses them in eight places — `_strip_burned_captions`
+(`^subtitled_\d+_(.+)$`) walks back to the uncaptioned file so the modal can
+RESTYLE captions instead of layering them, `_strip_burned_hook`
+(`^(?:hooked_\d+_|hook_)(.+)$`) does the same for the hook, `_canonical_clip_file`
+globs all three prefixes for downloads and social posting, and the dashboard
+decides whether a clip "has captions" from the prefix. Collapse the encodes and
+`hooked_<ts>_<clip>.mp4` never exists, so restyling captions walks back to a
+missing file. Fixing that means redesigning how clips are addressed across
+`app.py` and the dashboard — a large refactor of working code, to save less
+time than one constant did.
+
+Hardware encoding is not the answer on this box either: `h264_nvenc` is
+compiled into the image but the dev machine is Intel Iris Xe, so there is no
+NVIDIA GPU for the container to use.
+
+### Docker build context and the model cache
+
+A local `docker compose up --build` used to send **4.0 GB** of context and die
+with a BuildKit EOF. `.gitignore` excluded `output/` and `.cache/`;
+`.dockerignore` did not, so the faster-whisper model downloads (~2 GB in
+`.cache/huggingface`) and every rendered job (~800 MB in `output/`) were being
+uploaded to the daemon on every build. Both are produced at RUNTIME inside the
+container and bind-mounted back in by compose, so neither may ever enter the
+image. With them excluded the context is **5.1 MB**.
+
+A named volume for `/app/.cache/huggingface` was considered and deliberately
+NOT added: the dev compose bind-mounts `.:/app`, so that path already persists
+across container recreation, and a named volume would shadow the existing
+on-disk cache and force a multi-GB re-download for no gain. It only becomes
+the right answer if the source bind mount goes away.
 
 ### Hook grounding for on-screen clips (`hook_grounding.py`)
 

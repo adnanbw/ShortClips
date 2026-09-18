@@ -3,7 +3,53 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from meaningful_selector import MULTILINGUAL_RULES
+from meaningful_selector import (
+    MULTILINGUAL_RULES,
+    WHAT_YOU_ARE_JUDGING,
+    MAX_CLIP_SECONDS,
+    MIN_CLIP_SECONDS,
+    duration_rule_text,
+)
+
+
+def _pair(verification):
+    """(standalone, completeness) as plain numbers, for comparing two passes."""
+    verification = verification or {}
+    try:
+        return (
+            float(verification.get("standalone_score") or 0),
+            float(verification.get("completeness_score") or 0),
+        )
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
+
+
+def _is_worse(candidate_verification, reference_verification):
+    """True when a repair came back scoring lower than what it replaced."""
+    return sum(_pair(candidate_verification)) < sum(_pair(reference_verification))
+
+
+def accept_floor() -> float:
+    """Scores at or above this are good enough to SHIP, not just to rank.
+
+    The critic used to have exactly one way through: verdict PASS, four
+    booleans true, and 85+ on BOTH standalone and completeness. Measured on
+    two real jobs, that bar is not a quality control — it is a coin flip on
+    input the critic happens to like. An English stand-up set scored 95-100 on
+    six of seven candidates and sailed through; a Hinglish one scored 80/40,
+    30/40, 30/20, 60/30 and the job died with "Clip detection failed", which
+    tells the user nothing true.
+
+    85 on both axes, on a scale whose own prompt says "90+ should mean
+    genuinely excellent", is asking for near-excellence twice over from every
+    single clip. That is a preference. The floor below is the actual quality
+    question — is this worth publishing at all — and everything between the
+    two is decided by RANK, which is what a score is for.
+    """
+    try:
+        return float(os.environ.get("MEANINGFUL_ACCEPT_FLOOR", "").strip() or 70.0)
+    except (TypeError, ValueError):
+        return 70.0
 
 
 # ============================================================================
@@ -15,13 +61,15 @@ You are the FINAL standalone-quality verifier for a short-form video clip.
 
 IMPORTANT:
 
-You are seeing EXACTLY AND ONLY what the eventual viewer will hear.
+This transcript is EXACTLY AND ONLY the stretch of the video the clip covers.
 
 You have NO access to the rest of the source video.
 
 Do not imagine or infer missing context.
 Do not assume you know what was discussed earlier.
-Judge only the supplied clip transcript.
+Judge only the supplied clip.
+
+{what_you_are_judging}
 
 The product's #1 requirement is SEMANTIC COMPLETENESS.
 
@@ -60,7 +108,15 @@ Same thing as WHAT? FAIL.
 
 "She told me..."
 
-If who "she" is or why the conversation matters is missing, FAIL.
+If who "she" is or why the conversation matters is missing, FAIL. The viewer
+sees the speaker, but nothing on screen tells them who "she" is.
+
+NOT a fail:
+
+"I went to a Muslim school and I told them I wanted to do comedy."
+
+The viewer can see this is a comedian on a stage. The clip does not have to
+introduce them, name them, or explain that they perform for a living.
 
 A sentence beginning with "and", "but", or "so" is NOT automatically wrong.
 Only fail it when the meaning relies on information outside the supplied clip.
@@ -78,6 +134,9 @@ FAIL examples:
 "...the first thing is..."
 
 A grammatically complete sentence can still be semantically incomplete.
+
+Equally, a clip that has delivered its punchline or its result IS complete,
+even though nothing was summarised or explained afterwards.
 
 For example:
 
@@ -97,8 +156,22 @@ STORY TEST:
 For anecdotes, the viewer needs enough information to understand:
 - what happened
 - who matters
-- why the event matters
-- what lesson/result came from it
+- why the event is worth telling
+- how it resolves
+
+WHAT COUNTS AS AN ENDING DEPENDS ON THE CONTENT, NOT ON YOUR PREFERENCE:
+
+- Comedy, stand-up and personal anecdotes end on a PUNCHLINE, a payoff, an
+  absurd escalation, a reveal, or the outcome of the situation. That IS the
+  ending. A joke does not owe anyone a moral, a lesson or a takeaway, and
+  demanding one is not a completeness standard — it is a genre preference.
+- Explanatory and educational content ends on the answer, the conclusion, the
+  result or the lesson.
+
+Judge whether THIS piece finishes what IT started. Do not lower the bar for any
+genre: a joke with its punchline cut off is just as incomplete as an
+explanation with its conclusion cut off, and a story that stops before the
+resolution still fails.
 
 Do not demand unnecessary background.
 
@@ -106,9 +179,7 @@ LENGTH:
 
 The timestamp duration is provided for reference.
 
-15-90 seconds is allowed.
-25-60 seconds is generally preferred, but NEVER fail a complete clip simply
-because it is outside the preferred range.
+{duration_rule}
 
 {multilingual_rules}
 
@@ -146,6 +217,12 @@ work as an independent clip.
 
 Your task is to use the surrounding transcript to fix the boundaries.
 
+{what_you_are_judging}
+
+So a stretch of garbled text is NOT a reason to move a boundary: the audience
+hears the real words. Move a boundary only for MEANING — missing setup, or a
+payoff that has not landed yet.
+
 You receive:
 
 BEFORE
@@ -164,7 +241,7 @@ The repaired clip must:
 - end after the conclusion/payoff actually finishes
 - contain ONE coherent idea/story/lesson
 - be the SHORTEST version that preserves the full meaning
-- be between 15 and 90 seconds
+- be between {min_clip:.0f} and {max_clip:.0f} seconds
 
 CRITICAL TOPIC-BOUNDARY RULE:
 
@@ -219,7 +296,7 @@ If the candidate ends:
 
 extend forward until that explanation finishes.
 
-If no clean standalone clip can be produced inside 90 seconds, REJECT it.
+If no clean standalone clip can be produced inside {max_clip:.0f} seconds, REJECT it.
 
 {multilingual_rules}
 
@@ -653,6 +730,8 @@ def review_candidates_with_gemini(
         prompt = (
             BLIND_VERIFY_PROMPT.format(
                 multilingual_rules=MULTILINGUAL_RULES,
+                what_you_are_judging=WHAT_YOU_ARE_JUDGING,
+                duration_rule=duration_rule_text(),
                 candidate_id=candidate_id,
                 duration=range_data[
                     "duration"
@@ -737,6 +816,16 @@ def review_candidates_with_gemini(
         result[
             "strict_pass"
         ] = strict_pass
+
+        # Good enough to publish, even if not flawless. Kept separate from
+        # strict_pass so the ranking can still prefer the flawless ones.
+        floor = accept_floor()
+        result[
+            "usable"
+        ] = bool(
+            standalone >= floor
+            and completeness >= floor
+        )
 
         result[
             "standalone_score"
@@ -921,6 +1010,9 @@ def review_candidates_with_gemini(
             repair_prompt = (
                 REPAIR_PROMPT.format(
                     multilingual_rules=MULTILINGUAL_RULES,
+                    what_you_are_judging=WHAT_YOU_ARE_JUDGING,
+                    min_clip=MIN_CLIP_SECONDS,
+                    max_clip=MAX_CLIP_SECONDS,
                     failure_reason=(
                         failure_reason
                     ),
@@ -1063,10 +1155,10 @@ def review_candidates_with_gemini(
                     if (
                         repaired_range[
                             "duration"
-                        ] < 15.0
+                        ] < MIN_CLIP_SECONDS
                         or repaired_range[
                             "duration"
-                        ] > 90.0
+                        ] > MAX_CLIP_SECONDS
                     ):
 
                         decision = (
@@ -1074,8 +1166,9 @@ def review_candidates_with_gemini(
                         )
 
                         repair_reason = (
-                            "Repaired clip falls "
-                            "outside 15-90 seconds."
+                            "Repaired clip falls outside "
+                            f"{MIN_CLIP_SECONDS:.0f}-"
+                            f"{MAX_CLIP_SECONDS:.0f} seconds."
                         )
 
                         print(
@@ -1138,6 +1231,28 @@ def review_candidates_with_gemini(
                             f'{final_verification.get("reason")}'
                         )
 
+                        # A repair that made the clip WORSE must not be kept.
+                        # Measured on a real job: a candidate scoring 60/30 was
+                        # "repaired" to 30/20 and the repaired version replaced
+                        # it unconditionally, so the repair stage turned a
+                        # borderline clip into a certain rejection.
+                        if _is_worse(
+                            final_verification,
+                            initial_verification,
+                        ):
+
+                            print(
+                                "  Repair made it worse - "
+                                "keeping the original boundaries"
+                            )
+
+                            final_start = original_start
+                            final_end = original_end
+                            final_range = original_range
+                            final_verification = (
+                                initial_verification
+                            )
+
                         if (
                             final_verification[
                                 "strict_pass"
@@ -1146,6 +1261,21 @@ def review_candidates_with_gemini(
 
                             decision = (
                                 "REPAIR"
+                            )
+
+                        elif (
+                            final_verification[
+                                "usable"
+                            ]
+                        ):
+
+                            decision = (
+                                "REPAIR"
+                            )
+
+                            repair_reason += (
+                                " Below the flawless bar but "
+                                "above the publish floor."
                             )
 
                         else:

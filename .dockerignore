@@ -27,6 +27,36 @@ dashboard/node_modules/
 *.swp
 *.swo
 
+# Runtime output and caches. These are the reason a local build used to ship a
+# 2.9 GB context and die with a BuildKit EOF: .cache holds the Hugging Face /
+# faster-whisper model downloads (~2 GB) and output/ holds every rendered job
+# (~800 MB). Both are produced at RUNTIME inside the container and are bind-
+# mounted back in by docker-compose, so they must never enter the image.
+# .gitignore already excludes them; .dockerignore did not.
+output/
+uploads/
+downloads/
+.cache/
+.config/
+temp_*
+
+# Generated frontend/renderer build products — the image builds its own.
+dashboard/dist/
+dashboard/.vite/
+remotion/out/
+render-service/dist/
+
+# Local-only artefacts
+screenshots/
+_baseline_backup/
+.worktrees/
+.claude/
+.agents/
+.agent/
+.hallmark/
+*_metadata.json
+meaningful_debug/
+
 # Video files (will be mounted via volume)
 *.mp4
 *.avi

@@ -35,7 +35,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install FFmpeg, OpenCV deps, Node.js + npm + git (for yt-dlp JS + bgutil build).
+# Install FFmpeg, OpenCV deps and git (Node is installed separately below).
 # fontconfig + fonts-liberation back the subtitle font choices: without real
 # fonts libass falls back to DejaVu for every UI option (issue #57).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -46,8 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
-    nodejs \
-    npm \
     git \
     fontconfig \
     fonts-liberation \
@@ -56,11 +54,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-# Deno JS runtime — required by yt-dlp for some extractor challenges.
+# Node 22 for the bgutil PO token provider. Debian bookworm ships Node 20 and
+# bgutil refuses to start on it ("Node.js version too low. got 20.19.2, at
+# least 22.0.0 required"), so the provider was present but dead and the PO
+# token it mints was silently never produced. That token is what makes the
+# `mweb` client return 1080p with account cookies (yt_clients.py) — the exact
+# thing that stopped ~26 downloads a week falling through to the per-GB proxy.
+# Installing a Node the provider can run is the smaller change: removing the
+# provider would re-open a measured, expensive regression.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && node --version \
+    && rm -rf /var/lib/apt/lists/*
+
+# Deno JS runtime — required by yt-dlp for some extractor challenges. A
+# separate binary, unaffected by the Node version above.
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 # Helper token provider, baked in as a local Node script (no separate service).
-RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
+# PINNED. An unpinned `--depth 1` clone takes whatever is on the default
+# branch AT BUILD TIME, so two builds of the same commit can ship different
+# providers, and the Python plugin (bgutil-ytdlp-pot-provider, installed
+# from requirements.txt) has to match the script it drives. 2.0.0 is the
+# pair measured to work — it is what the running image carries and what
+# kaggle-worker/worker.py installs. Bump both together or not at all.
+RUN git clone --depth 1 --branch 2.0.0 --single-branch \
+        https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
     && cd /opt/bgutil-provider/server \
     && npm install --no-audit --no-fund \
     && npx tsc \

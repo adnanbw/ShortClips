@@ -39,6 +39,25 @@ def get_whisper_retry_model():
     return os.environ.get("WHISPER_RETRY_MODEL", DEFAULT_WHISPER_RETRY_MODEL).strip()
 
 
+def whisper_model_ladder(already_used=()):
+    """The models still worth trying after a pass — at most ONE.
+
+    This used to be two rungs, small -> large-v3-turbo -> large-v3, and the
+    escalation was the bug rather than the feature. Each rung re-transcribes
+    the WHOLE video: on the Hinglish stand-up that was ~16 minutes of CPU per
+    pass, the third load was OOM-killed with the second model still resident
+    (exit -9), and the job delivered nothing after ~50 minutes. The transcript
+    it was escalating away from was already good enough to cut clips from.
+
+    Picking the right model up front (transcribe_backends._probe_best_model,
+    which decides from ~75 seconds) is what replaced the extra rungs. What is
+    left is one repair attempt for a first pass that came back genuinely
+    unusable. Set WHISPER_RETRY_MODEL to choose which model that is.
+    """
+    model = get_whisper_retry_model()
+    return [model] if model and model not in already_used else []
+
+
 def _language_detection_segments():
     """How many windows to sample before committing to a language.
 
@@ -186,6 +205,22 @@ def transcribe_audio(video_path):
     """
     Transcribe audio from a video file via the configured ASR backend.
     Returns transcript in the same format as main.py for compatibility.
+
+    DELIBERATELY the RAW single-pass path, not transcribe_media_checked. This
+    is only reached by generate_srt_from_video, i.e. captioning an ElevenLabs
+    DUB that has no transcript of its own. Three reasons it must stay raw:
+
+      * the input is synthesized speech from a TTS engine, which is the
+        cleanest audio the pipeline ever sees — the failure mode the quality
+        gate exists for does not occur here;
+      * these captions are applied to an ALREADY RENDERED clip, so a
+        TranscriptQualityError would fail a job whose video is finished;
+      * a retry with a stronger model would double the cost of every dub for a
+        problem that has not been observed on dubbed audio.
+
+    Nothing here feeds clip SELECTION — the semantic pipeline never sees this
+    transcript, it only becomes subtitle timing. If that ever changes, this
+    call has to move to transcribe_media_checked.
     """
     # Lazy import: transcribe_backends imports helpers from this module.
     from transcribe_backends import transcribe_media
