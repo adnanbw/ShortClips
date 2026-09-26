@@ -20,6 +20,13 @@ transcript). The render needs the video file and would have to ship gigabytes
 back, so it stays local — the backend downloads the video in parallel with this
 call, and the two meet at the clip selector.
 
+The one exception is the SOURCE VIDEO, and only as a fallback. The kernel has
+to download it anyway to transcribe it, and it fetches from an egress YouTube
+does not challenge, so with ``source_rescue`` on it PUTs that file to B2 and
+the backend pulls it from there when its OWN download was refused. The video
+still never travels on the happy path; this is the second route for the one
+stage that had none. See ``source_rescue.py``.
+
 FAILURE IS NORMAL AND NEVER FATAL
 ---------------------------------
 Kaggle's GPU quota is weekly, its queue is shared, and its egress IP is
@@ -254,7 +261,40 @@ def _wait(api, slug: str, timeout: float, poll: float,
     return None
 
 
-def _fetch_transcript(api, slug: str) -> Optional[Dict[str, Any]]:
+def _absorb_source(destination: Path, sink: Optional[Dict[str, Any]],
+                   result: Optional[Dict[str, Any]]) -> None:
+    """Record the rescue copy this run left behind, if any.
+
+    Called before the transcript is judged, and before ``ok`` is even looked
+    at, because the two are independent: the upload happens first inside the
+    kernel precisely so that a transcription which OOMs still leaves a usable
+    video behind.
+    """
+    if sink is None:
+        return
+    source = (result or {}).get("source") or {}
+    if not source.get("uploaded"):
+        return
+    sink["uploaded"] = True
+    sink["bytes"] = source.get("bytes")
+    if source.get("title"):
+        sink["title"] = source["title"]
+
+    # yt-dlp's info for the source video, trimmed by the worker. The local
+    # download writes the attribution sidecar from its own copy of this; a
+    # rescued job has no other way to know who made the video.
+    info_path = destination / "source_info.json"
+    if info_path.exists():
+        try:
+            sink["info"] = json.loads(info_path.read_text(encoding="utf-8"))
+            sink.setdefault("title", sink["info"].get("title"))
+        except (ValueError, OSError) as exc:
+            print(f"⚠️ Kaggle source_info.json is unreadable: {exc}")
+
+
+def _fetch_transcript(api, slug: str,
+                      source_sink: Optional[Dict[str, Any]] = None
+                      ) -> Optional[Dict[str, Any]]:
     """Download the kernel's output and parse the transcript out of it."""
     destination = Path(tempfile.mkdtemp(prefix="kaggle_asr_"))
     try:
@@ -278,15 +318,20 @@ def _fetch_transcript(api, slug: str) -> Optional[Dict[str, Any]]:
                   f"({type(exc).__name__}); the transcript arrived intact.")
 
         result = destination / "result.json"
+        payload = None
         if result.exists():
             try:
                 payload = json.loads(result.read_text(encoding="utf-8"))
-                if not payload.get("ok"):
-                    print(f"⚠️ Kaggle worker reported failure: "
-                          f"{payload.get('error')}")
-                    return None
             except (ValueError, OSError):
-                pass
+                payload = None
+
+        # Before the ok check, not after: a run that uploaded the video and
+        # then failed to transcribe it is the case the rescue copy exists for.
+        _absorb_source(destination, source_sink, payload)
+
+        if payload is not None and not payload.get("ok"):
+            print(f"⚠️ Kaggle worker reported failure: {payload.get('error')}")
+            return None
 
         transcript_path = destination / "transcript.json"
         if not transcript_path.exists():
@@ -343,9 +388,19 @@ class RemoteTranscription:
     local transcription.
     """
 
-    def __init__(self, future, slug):
+    def __init__(self, future, slug, source_sink=None):
         self._future = future
         self.slug = slug
+        # Filled by the worker thread, deliberately NOT carried in the return
+        # value: a kernel can upload the video and then fail to transcribe it,
+        # and that run's transcript is None while its rescue copy is perfectly
+        # good. Routing the copy through the return value would throw it away
+        # in exactly the case the caller needs it most.
+        self._source = source_sink if source_sink is not None else {}
+
+    def source_video(self):
+        """What this run left in B2, or None. See ``source_rescue``."""
+        return dict(self._source) if self._source else None
 
     def collect(self, timeout=None):
         try:
@@ -375,21 +430,31 @@ def start(url: str, job_id: str = "job", language: Optional[str] = None,
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=1,
                               thread_name_prefix="kaggle-asr")
-    future = pool.submit(transcribe_url, url, job_id, language, on_progress)
+    source_sink = {}
+    future = pool.submit(transcribe_url, url, job_id, language, on_progress,
+                         source_sink)
     # The pool is shut down as soon as the single task finishes; it exists only
     # to keep the poll off the main thread while the video downloads.
     pool.shutdown(wait=False)
-    return RemoteTranscription(future, slug)
+    return RemoteTranscription(future, slug, source_sink)
 
 
 def transcribe_url(url: str, job_id: str = "job", language: Optional[str] = None,
-                   on_progress=None) -> Optional[Dict[str, Any]]:
+                   on_progress=None,
+                   source_sink: Optional[Dict[str, Any]] = None
+                   ) -> Optional[Dict[str, Any]]:
     """Transcribe ``url`` on Kaggle, or return None to fall back locally.
 
     Never raises. Every failure — no credentials, push rejected, kernel error,
     timeout, missing output — is a None, because the caller's fallback is a
     perfectly good local transcription and a job must not die because an
     optional accelerator was busy.
+
+    ``source_sink``, when given, is filled in place with whatever copy of the
+    SOURCE VIDEO the kernel left in B2 (``source_rescue``). It is a sink and
+    not a return value on purpose: a kernel that uploads the video and then
+    dies during transcription returns None here, and that run's rescue copy
+    is exactly what the caller needs.
     """
     if not enabled():
         return None
@@ -437,6 +502,25 @@ def transcribe_url(url: str, job_id: str = "job", language: Optional[str] = None
         "beam_size": int(_env_float("KAGGLE_ASR_BEAM_SIZE", 5)),
     }
 
+    # Ask the kernel to keep the video too, so a server whose own download
+    # YouTube refuses has a second place to get it. A PRESIGNED PUT URL, never
+    # the B2 keys: this dict is written into worker.py and pushed to Kaggle,
+    # where it stays in the kernel's version history.
+    upload = None
+    if source_sink is not None:
+        try:
+            import source_rescue
+            upload = source_rescue.prepare(job_id)
+        except Exception as exc:
+            print(f"⚠️ Kaggle source rescue unavailable "
+                  f"({type(exc).__name__}: {exc}).")
+    if upload:
+        job["source_upload"] = {"url": upload["url"],
+                                "content_type": upload["content_type"]}
+        # The key is ours, not the kernel's — recorded now so the object can
+        # be deleted even if the run never reports back.
+        source_sink["key"] = upload["key"]
+
     gpu = os.environ.get("KAGGLE_GPU", "1").strip() != "0"
     folder = Path(tempfile.mkdtemp(prefix="kaggle_push_"))
     try:
@@ -458,9 +542,16 @@ def transcribe_url(url: str, job_id: str = "job", language: Optional[str] = None
         on_progress=on_progress,
     )
     if state not in TERMINAL_OK:
+        # A kernel that ERRORed may still have uploaded the source video
+        # before it died — the worker does that first for this reason. Worth
+        # one output download to find out, but only for a run that actually
+        # finished: on a timeout the kernel is still going and its published
+        # output is the PREVIOUS version's.
+        if source_sink is not None and state in TERMINAL_BAD:
+            _fetch_transcript(api, slug, source_sink)
         return None
 
-    transcript = _fetch_transcript(api, slug)
+    transcript = _fetch_transcript(api, slug, source_sink)
     if transcript is None:
         return None
 

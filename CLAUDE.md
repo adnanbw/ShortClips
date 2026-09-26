@@ -527,6 +527,67 @@ whether `transcript.json` exists before believing the exception. The Linux
 container is UTF-8 and never hit this; only the host-side
 `tools/kaggle_setup.py test` did.
 
+### The download's second route (`source_rescue.py`)
+
+The download is the one stage with no fallback of its own, and what breaks it
+is not local. On 26-sep-2026 the Oracle box's YouTube cookies rotated
+overnight; every attempt came back LOGIN_REQUIRED / "Sign in to confirm you're
+not a bot" and the job died before it had a video. Nothing downstream could
+help, because nothing downstream had the file.
+
+The Kaggle kernel had it. Same yt-dlp, same BgUtils PO token, same `mweb`
+client — `yt_clients.HD_CLIENTS` and `worker.download_media` run the identical
+recipe — so **the technique is not the difference, the egress IP is**: Kaggle's
+fetches that video with no cookies at all while the datacenter IP is
+challenged. The kernel then threw the file away, because until now it only
+needed audio.
+
+So with `source_upload` set it downloads the full 1080p file instead, PUTs it
+to B2 and transcribes from that same file (faster-whisper decodes an mp4
+through ffmpeg exactly as it would an audio one — one download, no extraction
+step). `main.py` reaches for it **only from the `except` around
+`download_youtube_video`**, so the local download still runs first and still
+wins.
+
+Four rules, each one a failure mode:
+
+- **Kaggle stays optional.** `source_rescue.recover` re-raises the ORIGINAL
+  download error whenever it cannot help. The operator has to see that YouTube
+  refused the server; "the rescue copy was missing" is a consequence of that
+  and would bury the one thing they can act on.
+- **The B2 keys never reach Kaggle.** The kernel is handed a **presigned PUT
+  URL**, scoped to one object key and one verb and expiring in 3h
+  (`KAGGLE_SOURCE_URL_TTL`). `worker.py` is rendered with the job baked into
+  its source and pushed to a Kaggle account, where it stays in the kernel's
+  version history — an application key there would be write access to the
+  bucket the Instagram poster publishes from. The signed `ContentType` and the
+  header curl sends are pinned together in both files or B2 answers an opaque
+  403.
+- **The upload happens BEFORE transcription**, and the rescue copy rides back
+  in a **sink** rather than the return value. A kernel that OOMs decoding
+  returns None from `transcribe_url`, and that run's video is exactly what the
+  caller needs; routing it through the return value would discard it in the
+  only case it matters. An ERRORed kernel's output is fetched for the same
+  reason (not a timed-out one — that kernel is still running and its published
+  output is the previous version's).
+- **The copy is always deleted**, used or not: it is a whole source video, and
+  `kaggle-source/` exists as a separate prefix so a sweeper or lifecycle rule
+  can never touch an object a scheduled post resolves at publish time. A
+  reused transcript checkpoint skips the collect entirely, so give that prefix
+  a 1-day rule as the backstop.
+
+The rescued path also carries `source_info.json` — yt-dlp's info dict with
+`formats`/`thumbnails` stripped — because `attribution` is normally written
+from the LOCAL yt-dlp call, and a rescued job would otherwise publish
+uncredited.
+
+Cost when it is never needed: a video download instead of an audio one plus
+the PUT, ~50s, on a round trip that is already 3-8 minutes and runs in
+parallel with a local download that costs 33s. `KAGGLE_SOURCE_RESCUE=0` turns
+it off; absent B2 settings do the same. **It is redundancy, not immunity** —
+Kaggle's shared egress gets blocked too. What it buys is that both routes have
+to fail on the same day before a job dies.
+
 Ceiling worth knowing: Kaggle is a batch notebook platform being used as an
 inference API, and ~30 GPU-hours/week will not support the paid product. Modal,
 RunPod, fal and Replicate give a real HTTP endpoint with seconds of latency.

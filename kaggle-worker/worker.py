@@ -19,6 +19,15 @@ The download recipe is NOT improvised: it is the one measured to work from
 Kaggle's egress (mweb + a BgUtils PO token, 9.3s for a 10-minute video, no
 "Sign in to confirm you're not a bot"). Do not simplify it away.
 
+That recipe is also why this kernel can be asked to keep the VIDEO, not just
+the audio. It is the same yt-dlp, the same PO token and the same mweb client
+the backend runs — the egress IP is the entire difference, and when YouTube
+challenges the backend's datacenter IP and its account cookies have expired,
+this kernel is already holding the file the job died for want of. With
+``JOB["source_upload"]`` set it downloads the full 1080p file, PUTs it to a
+presigned URL the backend minted, and transcribes from that same file, so
+there is one download and no extraction step. See ``source_rescue.py``.
+
 Output contract — identical to ``transcribe_backends._transcribe_with_whisper``
 so the backend can drop it straight into the existing pipeline. Word merging
 (``merge_continuation_words``) is deliberately NOT done here: it runs on the
@@ -48,6 +57,11 @@ JOB = {
     "pin_language_above": 0.5,
     "language_detection_segments": 4,
     "beam_size": 5,
+    # {"url": <presigned PUT>, "content_type": "video/mp4"} when the backend
+    # wants this kernel to keep the VIDEO as well, so a server whose own
+    # download was refused has somewhere to get it. None = audio only, which
+    # is cheaper and is all transcription needs.
+    "source_upload": None,
 }
 # ============================================================================
 
@@ -57,6 +71,23 @@ BGUTIL_PORT = 4417
 AUDIO_STEM = WORKDIR / "job_audio"
 TRANSCRIPT_PATH = WORKDIR / "transcript.json"
 RESULT_PATH = WORKDIR / "result.json"
+SOURCE_INFO_PATH = WORKDIR / "source_info.json"
+
+#: yt-dlp's info dict is mostly `formats` and `thumbnails` — hundreds of
+#: entries and most of a megabyte, none of which the backend reads. Dropping
+#: them leaves a file small enough to ride back in the kernel output beside
+#: the transcript. The FIELDS kept are not listed here on purpose: the
+#: backend's attribution module owns that list, and a second copy of it here
+#: would be one more thing to keep in step.
+INFO_BULK_KEYS = ("formats", "thumbnails", "automatic_captions", "subtitles",
+                  "heatmap", "chapters", "requested_formats",
+                  "requested_downloads")
+
+#: A single presigned PUT is good for 5 GB on B2's S3 API, so this is not that
+#: limit — it is a sanity check. Anything past it is a playlist or a stream
+#: that should never have got this far, and spending Kaggle's upstream on it
+#: would delay the transcript the job actually needs.
+MAX_SOURCE_BYTES = 3 * 1024 * 1024 * 1024
 
 #: Kaggle mounts another kernel's output read-only under /kaggle/input/<slug>.
 #: The cache kernel (tools/kaggle_setup.py) puts the faster-whisper model
@@ -173,7 +204,7 @@ def start_token_server(deno, node_modules):
     raise RuntimeError("BgUtils token server failed to start")
 
 
-def clear_audio():
+def clear_media():
     for path in glob.glob(str(AUDIO_STEM) + ".*"):
         try:
             os.remove(path)
@@ -181,30 +212,60 @@ def clear_audio():
             pass
 
 
-def find_audio():
-    matches = glob.glob(str(AUDIO_STEM) + ".*")
-    return matches[0] if matches else None
+def find_media():
+    """The downloaded file, preferring the merged container.
+
+    A video download leaves the .mp4 beside the .info.json (and, briefly, the
+    separate video/audio streams), so "the first glob match" is not good
+    enough once this can fetch more than audio.
+    """
+    matches = [m for m in glob.glob(str(AUDIO_STEM) + ".*")
+               if not m.endswith(".info.json") and not m.endswith(".part")]
+    if not matches:
+        return None
+    for preferred in (".mp4", ".mkv", ".webm"):
+        for match in matches:
+            if match.endswith(preferred):
+                return match
+    return matches[0]
 
 
-def download_audio(url, deno):
-    """Audio only, through the strategies measured to work from Kaggle.
+#: The same 1080p spec the backend asks for. Kept in step deliberately: the
+#: reframe inherits the source height, so a rescue copy fetched at 720p would
+#: silently ship narrower clips than a normal run of the same video.
+VIDEO_FORMAT = (
+    "bestvideo[vcodec^=avc1][height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[vcodec^=avc1][height<=1080]+bestaudio/"
+    "best[height<=1080][ext=mp4]/best[ext=mp4]/best")
 
-    mweb + a PO token is the one that actually succeeded (9.3s); the others are
-    kept because YouTube's answer varies by video and by egress IP, and a
-    second strategy costs seconds while a failed job costs the whole run.
+
+def download_media(url, deno, want_video):
+    """Download through the strategies measured to work from Kaggle's egress.
+
+    mweb + a PO token is the one that actually succeeded (9.3s for a 10-minute
+    video); the others are kept because YouTube's answer varies by video and
+    by egress IP, and a second strategy costs seconds while a failed job costs
+    the whole run.
+
+    ``want_video`` fetches the full 1080p file rather than audio only, because
+    the backend asked for a rescue copy. Transcription then reads that same
+    file — faster-whisper decodes it through ffmpeg exactly as it would an
+    audio one, so there is one download and no extraction step.
     """
     strategies = [
         ("mweb + BgUtils PO token", "youtube:player_client=mweb"),
         ("default clients", "youtube:player_client=default"),
         ("web_embedded", "youtube:player_client=web_embedded,default"),
     ]
+    fmt = VIDEO_FORMAT if want_video else "bestaudio/best"
 
     for attempt in range(1, 3):
         for name, extractor in strategies:
-            clear_audio()
-            log(f"\n=== download attempt {attempt}: {name} ===")
+            clear_media()
+            log(f"\n=== download attempt {attempt}: {name} "
+                f"({'video' if want_video else 'audio'}) ===")
             started = time.time()
-            result = subprocess.run([
+            command = [
                 sys.executable, "-m", "yt_dlp",
                 "--no-playlist", "--force-ipv4",
                 "--js-runtimes", f"deno:{deno}",
@@ -212,14 +273,24 @@ def download_audio(url, deno):
                 f"youtubepot-bgutilhttp:base_url=http://127.0.0.1:{BGUTIL_PORT}",
                 "--extractor-args", extractor,
                 "--retries", "5", "--fragment-retries", "5", "--retry-sleep", "2",
-                "-f", "bestaudio/best",
+                "-f", fmt,
                 "-o", str(AUDIO_STEM) + ".%(ext)s",
-                url,
-            ])
-            audio = find_audio()
-            if result.returncode == 0 and audio:
-                log(f"Downloaded in {time.time() - started:.1f}s: {audio}")
-                return audio
+            ]
+            if want_video:
+                # The backend's local download normalises to mp4 the same way,
+                # and the rescue copy is handed straight to the render.
+                command += ["--merge-output-format", "mp4",
+                            # Who uploaded it. The backend writes the
+                            # attribution sidecar from its OWN yt-dlp call, so
+                            # on the rescue path this is the only record of
+                            # the creator and the clips would otherwise
+                            # publish uncredited.
+                            "--write-info-json"]
+            result = subprocess.run(command + [url])
+            media = find_media()
+            if result.returncode == 0 and media:
+                log(f"Downloaded in {time.time() - started:.1f}s: {media}")
+                return media
             log(f"Failed: {name}")
             time.sleep(3)
         if attempt == 1:
@@ -230,6 +301,72 @@ def download_audio(url, deno):
         "'Sign in to confirm you're not a bot', Kaggle's shared egress IP is "
         "currently blocked by YouTube — this is not a packaging problem."
     )
+
+
+def collect_source_info():
+    """Shrink yt-dlp's info.json and leave it in the kernel output.
+
+    Returns the video title, or None. Best-effort throughout: the transcript
+    is the job, and a missing title costs a nicely-named file, not a run.
+    """
+    matches = glob.glob(str(AUDIO_STEM) + "*.info.json")
+    if not matches:
+        return None
+    try:
+        info = json.loads(Path(matches[0]).read_text(encoding="utf-8"))
+    except Exception as exc:
+        log(f"Could not read the info json: {exc}")
+        return None
+    for key in INFO_BULK_KEYS:
+        info.pop(key, None)
+    try:
+        SOURCE_INFO_PATH.write_text(
+            json.dumps(info, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        log(f"Could not write source_info.json: {exc}")
+        return info.get("title")
+    return info.get("title")
+
+
+def upload_source(path, upload):
+    """PUT the downloaded video to the presigned URL the backend minted.
+
+    Never raises. This is the SECOND route for a file the backend usually
+    fetches itself; failing the kernel over it would trade a rescue copy for
+    the transcript, which is the thing the kernel is actually here to produce.
+
+    curl rather than requests: it streams from disk instead of reading a
+    150 MB file into a kernel's memory, and it is already installed.
+    """
+    url = (upload or {}).get("url")
+    if not url:
+        return None
+    size = os.path.getsize(path)
+    if size > MAX_SOURCE_BYTES:
+        log(f"Source is {size / 1e6:.0f} MB — too large to ship back; "
+            f"skipping the rescue upload.")
+        return None
+
+    content_type = (upload or {}).get("content_type") or "video/mp4"
+    log(f"Uploading the source copy ({size / 1e6:.1f} MB) ...")
+    started = time.time()
+    # The URL carries a signature and must NOT reach the log: a kernel log is
+    # readable by anyone with the account, and this one would be a writable
+    # handle on the bucket path until it expires. So no run(), which echoes.
+    result = subprocess.run(
+        ["curl", "-sS", "-f", "--retry", "3", "--retry-delay", "2",
+         "-X", "PUT", "-T", str(path),
+         # Must match the ContentType the backend SIGNED, or the signature
+         # does not verify and B2 answers 403.
+         "-H", f"Content-Type: {content_type}",
+         "-H", "Expect:", url],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        log(f"Rescue upload failed (curl exit {result.returncode}): "
+            f"{(result.stderr or '')[-500:]}")
+        return None
+    log(f"Uploaded the source copy in {time.time() - started:.1f}s")
+    return size
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +586,8 @@ def _opt_float(value):
 #: config, node_modules — so transcript.json fell off the end of page one and
 #: the backend downloaded twenty useless files and concluded the run produced
 #: no transcript, having watched the kernel succeed.
-KEEP_IN_OUTPUT = ("transcript.json", "result.json", "bgutil-server.log")
+KEEP_IN_OUTPUT = ("transcript.json", "result.json", "source_info.json",
+                  "bgutil-server.log")
 
 
 def prune_output():
@@ -477,12 +615,31 @@ def main():
     cache = find_cache()
     log(f"Cache: {cache or 'NOT MOUNTED (slow path)'}")
 
+    upload = JOB.get("source_upload") or None
+    log(f"Source rescue: {'on' if upload else 'off'}")
+
     server = None
+    source = {"uploaded": False}
     try:
         deno, _server_dir, node_modules = install_downloader()
         server = start_token_server(deno, node_modules)
-        audio = download_audio(JOB["url"], deno)
-        transcript = transcribe(audio, cache)
+        media = download_media(JOB["url"], deno, want_video=bool(upload))
+
+        # BEFORE transcription, not after. The upload is the whole reason the
+        # backend may be sitting without a video, and a transcription that
+        # OOMs or runs out of kernel time would otherwise take the rescue
+        # copy down with it - the one thing this kernel could still deliver.
+        if upload:
+            source["title"] = collect_source_info()
+            uploaded_bytes = upload_source(media, upload)
+            if uploaded_bytes:
+                source.update({"uploaded": True, "bytes": uploaded_bytes})
+                # Written now so the backend can use the copy even if the
+                # transcription below never finishes.
+                _write_result({"job_id": JOB.get("job_id"), "ok": False,
+                               "stage": "transcribing", "source": source})
+
+        transcript = transcribe(media, cache)
 
         TRANSCRIPT_PATH.write_text(
             json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
@@ -491,6 +648,7 @@ def main():
             "ok": True,
             "segments": len(transcript["segments"]),
             "language": transcript.get("language"),
+            "source": source,
         })
         log(f"\nWrote {TRANSCRIPT_PATH} "
             f"({len(transcript['segments'])} segments)")
@@ -503,6 +661,10 @@ def main():
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc()[-4000:],
+            # A failed run that still managed the upload is worth reporting:
+            # the backend can take the video even without a transcript, which
+            # is the difference between a slow job and a dead one.
+            "source": source,
         })
         log("\nWORKER FAILED:\n" + traceback.format_exc())
         raise

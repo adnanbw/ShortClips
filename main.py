@@ -2025,7 +2025,22 @@ if __name__ == '__main__':
         # the GPU sat idle. The language probe now runs inside the worker, on
         # the GPU, which is what removed the dependency.
         remote_transcription = kaggle_worker_start(args.url, output_dir)
-        input_video, video_title = download_youtube_video(args.url, output_dir)
+        try:
+            input_video, video_title = download_youtube_video(
+                args.url, output_dir)
+        except Exception as _download_error:
+            # The download is the one stage with no fallback of its own, and
+            # the thing that breaks it — YouTube challenging this server's
+            # datacenter IP once the account cookies expire — is not something
+            # the pipeline can fix from here. The Kaggle kernel fetches the
+            # same URL from an egress that is not challenged, so when the
+            # rescue upload is on it already has the video. See source_rescue:
+            # it re-raises THIS error rather than a derived one when it
+            # cannot help, and Kaggle stays strictly optional.
+            import source_rescue
+            input_video, video_title = source_rescue.recover(
+                remote_transcription, output_dir, _download_error,
+                sanitize_filename)
     else:
         remote_transcription = None
         input_video = args.input
@@ -2129,6 +2144,16 @@ if __name__ == '__main__':
                 # "clip detection failed", blaming the wrong stage.
                 print(f"❌ {e}")
                 raise RuntimeError(str(e)) from e
+            finally:
+                # The rescue copy has done its job either way: the local
+                # download won and it was never read, or it was read and
+                # already deleted. It is a whole source video, so leaving it
+                # to be swept "later" is how a bucket fills up. Idempotent.
+                try:
+                    import source_rescue
+                    source_rescue.discard_pending(remote_transcription)
+                except Exception as e:
+                    print(f"⚠️ Kaggle source cleanup skipped ({e}).")
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
