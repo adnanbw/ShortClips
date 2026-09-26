@@ -11,10 +11,16 @@ services:
     # `PermissionError: [Errno 13] Permission denied: 'uploads'` before
     # uvicorn ever imports the app — a crash loop with no obvious cause.
     #
-    # Running as the host's own uid is what makes a bind mount writable, and
-    # 1000 is the first non-system uid on Ubuntu, Debian and Fedora alike.
-    # HOST_UID/HOST_GID override it for a host where that is not true
-    # (`id -u` to check); Docker Desktop ignores the whole question.
+    # Running as the host's own uid is what makes a bind mount writable.
+    #
+    # CHECK `id -u` BEFORE TRUSTING THE DEFAULT. 1000 is the first non-system
+    # uid on a clean Ubuntu, Debian or Fedora, but an image that already
+    # created its own account takes it: on an Oracle Cloud Ubuntu instance the
+    # cloud agent holds 1000 and `ubuntu` is 1001. Get this wrong and the
+    # container falls through to "other" on the bind mount, which can read the
+    # directory but not create in it — `POST /api/process` then 500s on
+    # `makedirs('output/<job-id>')` before the job exists, so there is no job
+    # directory and no log to find, only "Internal Server Error" in the UI.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
       # useradd gave appuser HOME=/app. Overriding the uid means there is no
@@ -22,6 +28,19 @@ services:
       # ultralytics, matplotlib and fontconfig would each try to write their
       # caches to / and fail. Point it back at the writable mount.
       - HOME=/app
+      # An arbitrary uid has no /etc/passwd entry either, and that breaks any
+      # library that asks the system who it is. torch does exactly that while
+      # being IMPORTED — `_inductor.runtime.cache_dir_utils.default_cache_dir`
+      # names its cache after `getpass.getuser()` — so the job died on
+      # `from ultralytics import YOLO` with
+      #
+      #   KeyError: 'getpwuid(): uid not found: 1001'
+      #
+      # getpass.getuser() reads LOGNAME/USER/LNAME/USERNAME first and only
+      # falls back to pwd, so naming the process here fixes it for every such
+      # library at once rather than chasing each one's cache-path setting.
+      - USER=openshorts
+      - LOGNAME=openshorts
     ports:
       - "8000:8000"
     volumes:
