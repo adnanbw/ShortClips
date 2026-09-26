@@ -680,6 +680,49 @@ its attempts on a reel that is already live — `media_deleted_at` plus a sweepe
 is the safe shape), token refresh, and a per-account daily cap against
 Instagram's 50-posts-per-24h publishing limit.
 
+### Crediting the source creator (`attribution.py`)
+
+yt-dlp knows who uploaded a video — `uploader`, `uploader_id` (the modern
+`@handle`), `uploader_url`, `channel_id`, `license` — and `main.py` took
+`info['title']` and threw the rest away, so a published clip could never say
+whose work it was. It is recorded now, at the one moment it is knowable, as a
+`.source_attribution.json` sidecar in the job dir: a return value would not
+survive a resumed job, which re-enters with the video already on disk and no
+yt-dlp call left to make. `<title>_metadata.json` picks it up from there.
+
+**A YouTube handle is not an Instagram handle, and that is the whole design.**
+`@sharonvermacomedy` on YouTube may be somebody else entirely on Instagram, and
+an @mention naming the wrong person publicly tags a stranger — a failure that
+looks exactly like success, because a plausible handle is indistinguishable
+from a correct one. So the only cross-platform handles used are ones the
+creator published in their OWN video description, and `pick_handle` hands the
+model a CLOSED LIST and takes back an INDEX. It cannot write a handle, so it
+cannot invent an account. Same shape as the layout picker, for the same reason:
+a decision between known options is reliable where a free-form value is not.
+
+A description is full of links that are not the creator's — the venue, the
+editor, a sponsor. Measured on two real videos, Sharon Verma listed one
+Instagram account and Tarun Ratnani listed two: his own and the comedy club he
+performed at. A regex cannot separate those; the words beside them can
+("Follow me" vs "Venue"), so each candidate is stored with ~90 characters of
+surrounding text and that is what the model is shown. One candidate is taken
+without a model call at all.
+
+Every unresolved case degrades to naming the creator in words, which is still
+attribution and tags nobody: no candidates, several candidates with no Gemini
+key, an index out of range, a `0` meaning "none of these", or an API error.
+
+In the caption the credit goes ABOVE any trailing hashtags — appended after
+them it lands inside the tag block where nobody reads it — and when 2200
+characters bind, the hashtags are dropped first and the body trimmed second.
+The credit is the last thing to go, because an attribution silently truncated
+away is the exact failure the module exists to prevent. `CREDIT_TEMPLATE`
+changes the wording; `"credit": false` on `/api/instagram/schedule` omits it.
+
+**Credit is not a licence.** A standard YouTube upload stays all-rights-
+reserved whether or not a post names the author. `license` is recorded so the
+question can be asked; it was `None` on both videos measured.
+
 ### The x264 preset is a speed knob, not a quality knob
 
 `ffmpeg_utils.QUALITY` shipped at `-preset medium -crf 18`, and every "burn a

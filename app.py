@@ -4731,10 +4731,24 @@ class InstagramClipRequest(BaseModel):
     scheduled_local: Optional[str] = None
 
 
+def _attr_apply(caption: str, credit: str) -> str:
+    """Caption with the credit line folded in, above any trailing hashtags."""
+    if not credit:
+        return caption
+    try:
+        import attribution
+        return attribution.apply_to_caption(caption, credit)
+    except Exception:
+        return caption
+
+
 class InstagramScheduleRequest(BaseModel):
     job_id: str
     clips: List[InstagramClipRequest]
     timezone: Optional[str] = "UTC"
+    # Set false to publish without crediting the source creator. Default is to
+    # credit: these clips are someone else's work.
+    credit: Optional[bool] = True
     # Book every clip at the current instant. Not a separate publish path: the
     # poster's cron selects scheduled_at <= now, so these go out on its next
     # pass (within a minute) through the identical container/poll/publish
@@ -4778,6 +4792,25 @@ async def schedule_to_instagram(req: InstagramScheduleRequest, request: Request,
         raise HTTPException(status_code=404, detail="Metadata not found")
     base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
 
+    # Credit the creator whose video these clips came from. Resolved ONCE per
+    # request, not per clip: picking the Instagram account out of the source
+    # description is a Gemini call, and every clip of a job shares one source.
+    credit = ""
+    if req.credit is not False:
+        try:
+            import attribution
+            source_attr = ((job.get('result') or {}).get('source_attribution')
+                           or attribution.load(output_dir))
+            if source_attr:
+                handle = attribution.pick_handle(source_attr, "instagram")
+                credit = attribution.credit_line(source_attr, handle)
+                if credit:
+                    print(f"📅 Instagram: crediting {credit}")
+        except Exception as e:
+            # Never fatal. A post without credit is a shortcoming; a clip that
+            # would not schedule because of one is a bug.
+            print(f"⚠️ Could not build a credit line ({type(e).__name__}: {e})")
+
     payload = []
     for item in req.clips:
         if item.clip_index < 0 or item.clip_index >= len(clips):
@@ -4793,9 +4826,10 @@ async def schedule_to_instagram(req: InstagramScheduleRequest, request: Request,
         payload.append({
             "path": os.path.join(output_dir, filename),
             "clip_index": item.clip_index,
-            "caption": (item.caption
-                        or clip.get('video_description_for_instagram')
-                        or clip.get('video_description_for_tiktok') or ""),
+            "caption": _attr_apply(
+                item.caption
+                or clip.get('video_description_for_instagram')
+                or clip.get('video_description_for_tiktok') or "", credit),
             # Forwarded as a WALL CLOCK, with req.timezone alongside it. The
             # poster turns the pair into an instant in Postgres, which is the
             # only runtime in this chain guaranteed to hold a timezone database

@@ -895,6 +895,17 @@ def download_youtube_video(url, output_dir="."):
             # goes here rather than before the attempt.
             _relax_bgutil_timeouts()
             info = ydl.extract_info(url, download=False)
+        # The one moment the uploader is knowable. main.py used to take
+        # info['title'] and discard the rest, so a clip could never say whose
+        # video it came from. Recorded as a sidecar rather than returned,
+        # because a resumed job re-enters with the video already on disk and
+        # no yt-dlp call left to make.
+        try:
+            import attribution as _attr
+            _attr.save(output_dir, _attr.from_info(info))
+        except Exception as e:
+            print(f"⚠️ Could not record source attribution "
+                  f"({type(e).__name__}: {e}) — clips will publish uncredited.")
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
         expected = os.path.join(output_dir, f'{sanitized}.mp4')
         if os.path.exists(expected):
@@ -2242,6 +2253,17 @@ if __name__ == '__main__':
             # --keep-original) or in uploads/ (upload jobs).
             clips_data['source_video'] = os.path.basename(input_video)
             clips_data['output_format'] = output_format
+            # Who made the video these clips were cut from. Absent for uploads
+            # (a local file has no uploader) and for jobs that predate this.
+            try:
+                import attribution as _attr
+                _source_attr = _attr.load(output_dir)
+                if _source_attr:
+                    clips_data['source_attribution'] = _source_attr
+                    print(f"   🎥 Source credited to "
+                          f"{_source_attr.get('uploader') or 'unknown'}")
+            except Exception as e:
+                print(f"⚠️ Could not attach source attribution: {e}")
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             with open(metadata_file, 'w') as f:
                 json.dump(clips_data, f, indent=2)
