@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2, Check, Zap, Clock } from 'lucide-react';
 import { apiJson } from '../lib/api';
-import { track } from '../lib/analytics';
+import { track } from '../lib/telemetry';
 import Modal from './ui/Modal';
 
 // Opens when a job hits a 402 (quota exceeded). This is the highest-intent

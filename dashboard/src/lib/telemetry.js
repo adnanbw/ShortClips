@@ -5,6 +5,18 @@
 // won't have it — every call here is a safe no-op in that case, so analytics
 // can never break the app or leak into the open-source experience.
 //
+// THE FILENAME IS PART OF THAT GUARANTEE. This module was `analytics.js`, and
+// uBlock Origin and friends block any request whose path matches `analytics`
+// — including this one. The no-op above only covers a MISSING `window.op`;
+// it cannot help when the module itself never arrives, because a failed ES
+// import aborts the whole bundle and React never mounts. Self-hosted, that is
+// a blank page with one line in the console:
+//
+//   GET .../src/lib/analytics.js  net::ERR_BLOCKED_BY_CLIENT
+//
+// It stays hidden in local dev because blockers skip localhost, and appears
+// the moment the dashboard is served from a real host. Do not rename it back.
+//
 // Events (name — meaning):
 //   - Signup             — account created / signed in
 //   - QuotaWallSeen      — the 402 wall modal opened

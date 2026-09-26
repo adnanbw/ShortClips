@@ -7,7 +7,7 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { getApiUrl } from '../config';
 import { apiFetch, apiJson, getToken, setToken, clearToken } from '../lib/api';
-import { track, identify, reset as resetAnalytics } from '../lib/analytics';
+import { track, identify, reset as resetAnalytics } from '../lib/telemetry';
 import { report as reportAttribution } from '../lib/attribution';
 
 const AuthContext = createContext(null);

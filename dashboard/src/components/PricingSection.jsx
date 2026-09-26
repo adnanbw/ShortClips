@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Check, Loader2, Zap, Cpu, KeyRound, Send, HardDrive, Bot } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { apiJson } from '../lib/api';
-import { track } from '../lib/analytics';
+import { track } from '../lib/telemetry';
 import SegmentedControl from './ui/SegmentedControl';
 
 const PLAN_ORDER = ['starter', 'creator', 'pro'];
