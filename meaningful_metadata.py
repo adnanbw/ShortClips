@@ -7,6 +7,77 @@ from meaningful_selector import MULTILINGUAL_RULES
 
 
 # ============================================================================
+# METADATA LANGUAGE
+# ============================================================================
+#
+# The hook is BURNED INTO THE VIDEO, and the renderer that burns it
+# (hooks.create_hook_image) draws with PIL and one font file. PIL has no
+# fontconfig fallback, so a glyph that font lacks is a tofu box — which is
+# exactly what a Hindi hook came out as on job b975769f, while the emoji beside
+# it rendered fine because emoji get their own font by hand. Captions escape
+# this by being transliterated (transliterate.py); the hook and title escape it
+# by being written in English in the first place.
+#
+# That is a product decision as much as a rendering one: the title and
+# descriptions are read on YouTube, TikTok and Instagram search, where the
+# creator asked for English.
+#
+# ENGLISH is the default. METADATA_LANGUAGE=speaker restores the original
+# behaviour — metadata in whatever language the speaker used — which is the
+# right setting for a deployment whose creators publish in Spanish, Portuguese
+# or any other Latin-script language, where English metadata over
+# native-language audio is a regression rather than a fix.
+
+_LANGUAGE_ENGLISH = """
+METADATA LANGUAGE:
+
+Write EVERY field in ENGLISH, whatever language the transcript is in.
+
+This is the one place a translation is wanted: the hook is burned onto the
+video in a Latin-only font and the title is read in platform search. The words
+of the clip itself are untouched by this — you are naming the moment, not
+re-voicing it.
+
+Keep names, places and brands as they are. Never claim the clip is in English,
+and never invent detail that the transcript does not contain just because it
+reads better in English.
+""".strip()
+
+_LANGUAGE_SPEAKER = """
+METADATA LANGUAGE:
+
+Write EVERY field in the same language the speaker actually uses in this
+transcript. Do not translate the clip into English.
+
+If the speaker code-switches (for example Hindi with English words mixed in),
+write the metadata the same way the speaker talks — that is what the audience
+for this clip reads. Hashtags may stay in their usual Latin form.
+""".strip()
+
+
+def metadata_in_english() -> bool:
+    return (os.environ.get("METADATA_LANGUAGE", "").strip().lower()
+            or "english") != "speaker"
+
+
+def metadata_language_rule() -> str:
+    """The METADATA LANGUAGE block the prompt carries for this deployment."""
+    return _LANGUAGE_ENGLISH if metadata_in_english() else _LANGUAGE_SPEAKER
+
+
+def metadata_language_target(detected_language: str) -> str:
+    """The language a prompt should be TOLD to write hooks and titles in.
+
+    hook_grounding rewrites the same two burned fields from the clip's frames,
+    so it has to obey the same policy or it would put the source script back
+    onto the video after this module took it off.
+    """
+    if metadata_in_english():
+        return "English"
+    return detected_language or "unknown"
+
+
+# ============================================================================
 # METADATA PROMPT
 # ============================================================================
 
@@ -46,7 +117,7 @@ viral_hook_text:
 - designed as an on-screen opening text overlay
 - curiosity-driven but truthful
 - concrete rather than generic
-- same language as the transcript
+- written in the language required by METADATA LANGUAGE below
 - do not use fake statistics
 - do not invent claims
 - emojis are optional, maximum 1
@@ -55,7 +126,7 @@ video_title_for_youtube_short:
 - maximum 100 characters
 - clear and curiosity-driven
 - accurately represents the actual clip
-- same language as transcript
+- written in the language required by METADATA LANGUAGE below
 - no fake claims
 
 video_description_for_tiktok:
@@ -64,14 +135,14 @@ video_description_for_tiktok:
 - 3-5 relevant hashtags
 - no generic spam hashtags
 - no fake CTA such as "comment X and I'll send you..."
-- same language as transcript
+- written in the language required by METADATA LANGUAGE below
 
 video_description_for_instagram:
 - 1-2 short sentences
 - useful and natural
 - 3-5 relevant hashtags
 - no claims outside the transcript
-- same language as transcript
+- written in the language required by METADATA LANGUAGE below
 
 QUALITY RULE:
 
@@ -80,14 +151,7 @@ the clip.
 
 {multilingual_rules}
 
-METADATA LANGUAGE:
-
-Write EVERY field in the same language the speaker actually uses in this
-transcript. Do not translate the clip into English.
-
-If the speaker code-switches (for example Hindi with English words mixed in),
-write the metadata the same way the speaker talks — that is what the audience
-for this clip reads. Hashtags may stay in their usual Latin form.
+{metadata_language}
 
 TRANSCRIPT LANGUAGE (detected, may be approximate for code-switched speech):
 {language}
@@ -477,6 +541,7 @@ def generate_metadata_with_gemini(
         prompt = (
             METADATA_PROMPT.format(
                 multilingual_rules=MULTILINGUAL_RULES,
+                metadata_language=metadata_language_rule(),
                 language=language,
                 transcript=transcript,
             )

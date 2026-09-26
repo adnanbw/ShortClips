@@ -533,6 +533,153 @@ RunPod, fal and Replicate give a real HTTP endpoint with seconds of latency.
 The seam is `main.transcribe_video(source_url=...)`, so swapping the backend is
 one module.
 
+### Burned-in text is Latin (`transliterate.py`)
+
+Two different fixes for one complaint, because the video carries two kinds of
+text and they fail differently.
+
+**Captions are TRANSLITERATED, never translated.** "मैंने वह किया" is burned as
+"maine wah kiya" — the words the speaker actually said, spelled the way their
+own audience types them. Translating instead would put a caption on screen that
+says something different from the audio, on a clip whose timing, jokes and
+metadata are all anchored to the real words. (The source video in the job that
+prompted this burns its own captions in Latin Hinglish, which is what the
+creator's audience already reads.)
+
+It is a Gemini call and not a library, and that is measured. Deterministic
+romanisers work on CODEPOINTS, and this speech is code-switched: a Hinglish
+transcript writes English loanwords in Devanagari. On one line of the real
+stand-up, "डिसकनेक्टिंग फ्लाइट" comes back as `ddisknekttiNg phlaaitt` from
+unidecode and `DisakanekTiMga phlAiTa` from ITRANS, where the right answer is
+"disconnecting flight" — only a model knows the word was English before someone
+spelled it in another script. On the 10-minute Hinglish job it converted
+915 of 915 non-Latin words in 41 s across 4 calls, and produced `route`, `air
+force`, `uncle`, `heart attack` for the loanwords beside `zaroorat`, `puchne`,
+`zabardast` for the Hindi.
+
+**The contract is one word in, one word out.** Captions are karaoke — every
+word has its own start and end and is highlighted on its own — so a model that
+merges two words or splits one silently shifts the timing of everything after
+it in the block. Every chunk is checked for length and every word for script
+and token count, and anything that fails KEEPS ITS ORIGINAL TEXT. The fallback
+is the source script, deliberately not a library: Devanagari a viewer can read
+beats Latin nobody can. The length check sits immediately above the `zip` it
+protects and not inside the call that produced the list, because `zip`
+truncates to the shorter side without complaining — which is exactly the silent
+mis-alignment the module exists to prevent, and a test that stubbed the API
+call walked straight through the guard when it lived there.
+
+**A failed chunk is HALVED and retried, not discarded.** Refusing to zip a
+mismatch is right; throwing the whole chunk away is far too blunt. On a real
+12-minute job (`44f91a11`) one chunk came back 301 words for 300, took all 300
+with it, and put Devanagari into the last seconds of a published clip — 10 of
+clip 2's 130 words. Splitting turns "300 words lost" into at most one, and the
+halves are easier questions besides: the model miscounts long lists, not short
+ones. Replayed on that same transcript the retry hit BOTH failure modes at
+once, a 503 and the same 301-for-300 miscount, and converted 982 of 982.
+
+Only `words[i]["latin"]` is written; segment `text` is untouched, because the
+selector, the critic and the metadata writer read that and have to reason about
+what was really said. `merge_continuation_words` merges `latin` alongside
+`word`, or a continuation fragment's script reappears in a romanised caption.
+The annotation runs once in `main.py` and rides into `<title>_metadata.json`,
+so a caption restyle from the modal months later finds the spellings already
+there. `CAPTION_SCRIPT=original` turns it off. It applies to every non-Latin
+script, Cyrillic and CJK included — reasonable for Hinglish, a judgement call
+for a Japanese deployment.
+
+**The hook and title are written in ENGLISH instead, and that is a rendering
+constraint before it is a product one.** `hooks.create_hook_image` draws with
+PIL and ONE font file, and PIL has no fontconfig fallback, so a glyph that font
+lacks is a tofu box. Job `b975769f` shipped a Devanagari hook as ☐☐☐☐ across the
+top of the clip with the 😂 beside it rendering perfectly — emoji get their own
+font by hand (`_load_emoji_font`), every other script gets nothing. Captions
+escape this through libass, which does fall back; the hook cannot.
+`meaningful_metadata.metadata_language_rule()` is the single policy and
+`METADATA_LANGUAGE=speaker` restores the old behaviour, which is the right
+setting for a Spanish or Portuguese deployment where the audio is already
+Latin-script. `hook_grounding` REWRITES those same two burned fields, so it is
+told the same target language (`metadata_language_target`) — left saying "the
+transcript's language" it would put Devanagari back on the clip after the
+metadata writer had taken it off. `hooks._romanise_for_font` is the last-resort
+guard for a hook someone types into the modal in their own script; without a
+Gemini key it logs and renders as before rather than dropping the overlay.
+
+### Publishing to a self-hosted Instagram poster (`instagram_publish.py`)
+
+A second destination beside Upload-Post, whose free tier caps posts. The poster
+is a separate project — Supabase + `pg_cron` every minute + an Edge Function +
+the owner's own Meta app — and everything needed to wire it up lives in
+`instagram/` (SQL migration, the `ingest-post` function, the worker patch).
+Upload-Post is untouched and still the default; the destination only appears in
+the scheduling modal when `/api/instagram/config` says the server is configured.
+
+The clip goes to **Backblaze B2** and only its object KEY goes to Supabase. B2
+rather than the poster's own Supabase Storage because that bucket caps files at
+50 MB ("Free Supabase projects have a 50 MB global max upload limit", its own
+`frontend-setup.sql`) and clips out of this pipeline measured 28.8 / 30.8 /
+33.9 / 49.2 / 51.2 / 55.2 MB across two real jobs — two of six already do not
+fit. Instagram fetches the video itself from a presigned URL the WORKER mints at
+publish time: a URL minted at schedule time would have to outlive a schedule
+measured in days, and signing late also makes a failed container self-healing
+(the row returns to `scheduled` and the next pass signs again). Traffic is
+outbound only, which is not a preference — OpenShorts runs behind NAT.
+
+**The file to publish is resolved from disk with `_canonical_clip_file`, never
+from `clip['video_url']`.** A clip exists as up to four files (clean, `hooked_`,
+`subtitled_`, `recut_`) and the captioned one is the deliverable; that helper is
+the single place that knows which is newest, and it keeps up with a caption
+re-style done long after the job finished. Getting this wrong publishes
+uncaptioned clips and nothing notices until they are live.
+
+**Timezone arithmetic happens in Postgres, for both scheduling modes.** A
+posting slot's `slot_time` and a picked time are both WALL CLOCKS, and of the
+four runtimes in this chain only Postgres is guaranteed to carry a timezone
+database: `new Date("2026-09-24T20:00:00")` is UTC inside Deno and the viewer's
+zone in a browser, and Python needs the `tzdata` package on any host without a
+system zoneinfo — Windows and slim containers both. The first version converted
+in Python and its tests died on the dev box with `ZoneInfoNotFoundError: No time
+zone found with key UTC`; had that box happened to have the data, the same code
+would have shipped and booked reels hours off with nothing reporting an error.
+So `scheduled_local` + `timezone` travel as a pair and `public.local_to_utc`
+resolves them, which is the same path `public.next_free_slots` already uses.
+
+**The upload is a BACKGROUND task and the modal polls it.** A clip is tens of
+megabytes and the upstream of a home connection carries it — ~2 minutes each
+for the 28-43 MB files this pipeline produces. The first version held the HTTP
+request open for the whole batch, which looked hung, so the button was pressed
+again and each press started another full upload of the same clips: six
+overlapping uploads competing for one upstream, 870 MB of duplicates in the
+bucket, and not one row to show for it, because no ingest call ever finished.
+`POST /api/instagram/schedule` returns a `task_id` at once,
+`GET /api/instagram/schedule/{task_id}` reports `stage` + `done`/`total`, and a
+second request for a job already uploading is handed the FIRST task's id
+instead of racing it. The progress count is clips PROCESSED, not uploaded — a
+test caught the bar running backwards (2 of 2, then 1 of 2) when a clip was
+skipped.
+
+**"Post now" is a booking, not a bypass.** It inserts with `scheduled_at =
+now()`; the poster's `createDue` already selects `scheduled_at <= now`, so the
+next cron pass picks it up and it travels the identical container/poll/publish
+route with the same retry ladder. A separate immediate-publish path would be a
+second thing to keep correct for no gain. It therefore publishes *within a
+minute*, not instantly, and queueing a whole job that way puts every clip on
+the feed minutes apart — the modal says so rather than silently spacing them.
+
+**Every failure takes its upload back out.** An object whose row the poster
+refused is invisible, unpublishable and billed forever, so a rejected item is
+deleted individually and a failed batch deletes all of them — the poster's own
+dashboard does the same after a failed insert. Object keys carry a random
+component for the mirror-image reason: re-queueing a clip after a caption fix
+must not overwrite the object an earlier, still-scheduled post points at, since
+the key is resolved at publish time.
+
+Deliberately NOT done: deleting the object inline after `media_publish` (if the
+publish succeeds and the row update fails, the retry finds no media and burns
+its attempts on a reel that is already live — `media_deleted_at` plus a sweeper
+is the safe shape), token refresh, and a per-account daily cap against
+Instagram's 50-posts-per-24h publishing limit.
+
 ### The x264 preset is a speed knob, not a quality knob
 
 `ffmpeg_utils.QUALITY` shipped at `-preset medium -crf 18`, and every "burn a

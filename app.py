@@ -4640,6 +4640,163 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         print(f"❌ Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---------------------------------------------------------------------------
+# Self-hosted Instagram poster (instagram_publish.py)
+# ---------------------------------------------------------------------------
+# A second, independent destination alongside Upload-Post: clips go to
+# Backblaze B2 and their keys to a private Supabase project that publishes them
+# through the owner's own Meta app. Upload-Post is untouched and still the
+# default; this exists because its free tier caps posts.
+
+class InstagramClipRequest(BaseModel):
+    clip_index: int
+    caption: Optional[str] = None
+    # Wall-clock local time, "2026-09-24T20:00:00", meant in the request's
+    # `timezone`. Absent means "book the next free posting slot", which the
+    # poster resolves in Postgres.
+    scheduled_local: Optional[str] = None
+
+
+class InstagramScheduleRequest(BaseModel):
+    job_id: str
+    clips: List[InstagramClipRequest]
+    timezone: Optional[str] = "UTC"
+    # Book every clip at the current instant. Not a separate publish path: the
+    # poster's cron selects scheduled_at <= now, so these go out on its next
+    # pass (within a minute) through the identical container/poll/publish
+    # route, retries included.
+    post_now: Optional[bool] = False
+
+
+@app.get("/api/instagram/config")
+async def instagram_config():
+    """Whether the self-hosted poster is wired up, so the UI can offer it."""
+    import instagram_publish
+    return {"configured": instagram_publish.configured(),
+            "missing": instagram_publish.missing_settings()}
+
+
+@app.post("/api/instagram/schedule")
+async def schedule_to_instagram(req: InstagramScheduleRequest, request: Request,
+                                background_tasks: BackgroundTasks):
+    """Upload clips to B2 and queue them on the self-hosted poster."""
+    import instagram_publish
+
+    if not instagram_publish.configured():
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram publishing is not configured on this server. "
+                   "Missing: " + ", ".join(instagram_publish.missing_settings()))
+
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    clips = (job.get('result') or {}).get('clips') or []
+    if not clips:
+        raise HTTPException(status_code=400, detail="Job result not available")
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+
+    payload = []
+    for item in req.clips:
+        if item.clip_index < 0 or item.clip_index >= len(clips):
+            raise HTTPException(status_code=404,
+                                detail=f"Clip {item.clip_index} not found")
+        clip = clips[item.clip_index]
+        # Resolved from DISK, not from clip['video_url']: a clip exists as up to
+        # four files (clean / hooked_ / subtitled_ / recut_) and the captioned
+        # one is what should be published. _canonical_clip_file is the single
+        # place that knows which is newest, and it keeps up with a caption
+        # re-style done after the job finished.
+        filename = _canonical_clip_file(output_dir, base_name, item.clip_index)
+        payload.append({
+            "path": os.path.join(output_dir, filename),
+            "clip_index": item.clip_index,
+            "caption": (item.caption
+                        or clip.get('video_description_for_instagram')
+                        or clip.get('video_description_for_tiktok') or ""),
+            # Forwarded as a WALL CLOCK, with req.timezone alongside it. The
+            # poster turns the pair into an instant in Postgres, which is the
+            # only runtime in this chain guaranteed to hold a timezone database
+            # — and it is the same code path its posting slots already use.
+            "scheduled_local": item.scheduled_local,
+        })
+
+    # A clip is tens of megabytes and the upstream of a home connection is what
+    # carries it — measured at roughly two minutes each. Holding the HTTP
+    # request open for that long is what caused the real failure this replaces:
+    # the modal looked hung, the user pressed schedule again, and each press
+    # started ANOTHER full upload of the same clips. Six concurrent uploads then
+    # competed for the same upstream, so every one of them got slower, and 870
+    # MB of duplicates landed in the bucket with no rows pointing at any of it.
+    #
+    # So it returns a task id at once and uploads in the background, the same
+    # shape /api/thumbnail/publish already uses.
+    running = _instagram_task_for_job(req.job_id)
+    if running:
+        # The guard that stops the pile-up. A second press gets the FIRST
+        # task's id and watches it finish, rather than racing it.
+        print(f"📅 Instagram: {req.job_id} is already uploading — "
+              f"returning task {running}")
+        return {"task_id": running, "status": publish_jobs[running]["status"],
+                "already_running": True}
+
+    task_id = str(uuid.uuid4())
+    publish_jobs[task_id] = {
+        "kind": "instagram", "job_id": req.job_id, "status": "uploading",
+        "stage": "uploading", "done": 0, "total": len(payload),
+        "result": None, "error": None,
+    }
+
+    def run_upload():
+        def on_progress(p):
+            entry = publish_jobs.get(task_id)
+            if entry:
+                entry.update(stage=p["stage"], done=p["done"], total=p["total"])
+        try:
+            result = instagram_publish.schedule_clips(
+                payload, req.job_id, req.timezone, bool(req.post_now),
+                on_progress=on_progress)
+            publish_jobs[task_id].update(
+                status="done", stage="done", result=result,
+                done=len(payload))
+            print(f"📅 Instagram: queued {result['queued']}/{len(payload)} "
+                  f"clip(s) from {req.job_id}")
+        except Exception as e:
+            publish_jobs[task_id].update(
+                status="failed", stage="failed", error=str(e))
+            print(f"❌ Instagram schedule failed for {req.job_id}: {e}")
+
+    background_tasks.add_task(run_upload)
+    return {"task_id": task_id, "status": "uploading", "total": len(payload)}
+
+
+def _instagram_task_for_job(job_id):
+    """The id of an upload already running for this job, if any."""
+    for task_id, entry in publish_jobs.items():
+        if (entry.get("kind") == "instagram" and entry.get("job_id") == job_id
+                and entry.get("status") == "uploading"):
+            return task_id
+    return None
+
+
+@app.get("/api/instagram/schedule/{task_id}")
+async def instagram_schedule_status(task_id: str):
+    """Poll a background upload. The modal drives its progress bar off this."""
+    entry = publish_jobs.get(task_id)
+    if not entry or entry.get("kind") != "instagram":
+        raise HTTPException(status_code=404, detail="Upload task not found")
+    return entry
+
+
 @app.get("/api/social/user")
 async def get_social_user(request: Request):
     """Proxy to fetch user profiles from Upload-Post.

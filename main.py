@@ -2109,6 +2109,27 @@ if __name__ == '__main__':
                   f"switching to visual analysis.")
             transcript = None
 
+        # Burned text is Latin, whatever the speaker's script. This annotates
+        # the WORDS only (transcript["segments"][i]["words"][j]["latin"]);
+        # every judge downstream still reads the original off the segment text.
+        # It runs here, once, rather than at caption time, because the
+        # annotated transcript is what goes into <title>_metadata.json — so a
+        # caption restyle from the modal (/api/subtitle) months later finds the
+        # spellings already there and never pays for them again.
+        if transcript is not None:
+            try:
+                import transliterate as _translit
+                converted = _translit.annotate_transcript(
+                    transcript, language=transcript.get("language") or "")
+                if converted:
+                    print(f"🔤 Captions romanised: {converted} word(s) "
+                          f"rewritten in the Latin alphabet.")
+            except Exception as e:
+                # Never fatal. Captions in the original script are a cosmetic
+                # regression; losing the clip over one is not.
+                print(f"⚠️ Transliteration unavailable "
+                      f"({type(e).__name__}: {e}) — captions keep their script.")
+
         # 4. Clip Selection
         #
         # Default transcript path is now our semantic selector:

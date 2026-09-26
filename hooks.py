@@ -205,6 +205,29 @@ HOOK_STYLES = {
 }
 
 
+def _romanise_for_font(text):
+    """Rewrite `text` in the Latin alphabet when the hook font cannot draw it.
+
+    Returns `text` untouched when it is already Latin, and also when the
+    rewrite is unavailable (no Gemini key, API error): boxes are bad, but a
+    hook that silently disappears or gets mangled offline is worse, and the
+    caller's failure path would cost the user the overlay entirely.
+    """
+    try:
+        import transliterate as _translit
+        if not _translit.needs_transliteration(text):
+            return text
+        latin = _translit.to_latin_text(text)
+    except Exception as e:
+        print(f"⚠️ Hook text is not in the Latin alphabet and could not be "
+              f"transliterated ({type(e).__name__}: {e}) — some characters "
+              f"may render as boxes.")
+        return text
+    if latin != text:
+        print(f"🔤 Hook romanised for the overlay font: {latin}")
+    return latin
+
+
 def create_hook_image(text, target_width, output_image_path="hook_overlay.png", font_scale=1.0, style="classic"):
     """
     Generates a hook overlay image using pixel-based wrapping.
@@ -237,6 +260,17 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     except Exception as e:
         print(f"⚠️ Warning: Could not load font {FONT_PATH}, using default. Error: {e}")
         font = ImageFont.load_default()
+
+    # Script handling. PIL draws with ONE font file and has no fontconfig
+    # fallback, so any glyph NotoSerif-Bold lacks becomes a tofu box — which is
+    # what a Hindi hook looked like on job b975769f, ☐☐☐☐ across the top of the
+    # clip with the emoji beside it rendering perfectly (emoji get their own
+    # font by hand, below). The automatic hook is written in English now
+    # (meaningful_metadata.metadata_language_rule), so this only ever fires for
+    # a hook someone typed into the modal in their own script. Transliterating
+    # it is the one repair that keeps the words: stripping the text leaves an
+    # empty overlay and drawing it leaves boxes.
+    text = _romanise_for_font(text)
 
     # Emoji handling: render with an emoji-capable font if one exists,
     # otherwise strip emoji instead of drawing tofu boxes.

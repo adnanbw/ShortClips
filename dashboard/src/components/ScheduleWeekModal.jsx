@@ -63,11 +63,38 @@ function formatDate(date) {
     return `${MONTHS[date.getMonth()]} ${date.getDate()}`;
 }
 
+// Browsers report the IANA zone the OS gives them, and that is often a LEGACY
+// ALIAS rather than the modern name: Windows in India resolves to
+// Asia/Calcutta, not Asia/Kolkata. Both are valid and mean the same zone, but
+// only the modern one is in TIMEZONES above.
+const LEGACY_TZ_ALIASES = {
+    'Asia/Calcutta': 'Asia/Kolkata',
+    'Asia/Saigon': 'Asia/Ho_Chi_Minh',
+    'Asia/Katmandu': 'Asia/Kathmandu',
+    'Asia/Rangoon': 'Asia/Yangon',
+    'Europe/Kiev': 'Europe/Kyiv',
+    'America/Buenos_Aires': 'America/Argentina/Buenos_Aires',
+    'US/Pacific': 'America/Los_Angeles',
+    'US/Eastern': 'America/New_York',
+    'US/Central': 'America/Chicago',
+    'US/Mountain': 'America/Denver',
+};
+
+/**
+ * The viewer's timezone, as an IANA name.
+ *
+ * This used to return 'UTC' for any zone missing from TIMEZONES, which made a
+ * hardcoded DROPDOWN LIST silently decide what time the user's posts go out.
+ * On a machine reporting Asia/Calcutta that shifted every scheduled post by
+ * 5.5 hours — invisible on the Upload-Post path, which just echoes the zone
+ * back, and plainly wrong on the Instagram path, where the poster resolves a
+ * posting slot in it. The list is for the picker; it is not a validator.
+ */
 function detectTimezone() {
     try {
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        if (TIMEZONES.find(t => t.value === tz)) return tz;
-        return 'UTC';
+        if (!tz) return 'UTC';
+        return LEGACY_TZ_ALIASES[tz] || tz;
     } catch {
         return 'UTC';
     }
@@ -83,15 +110,66 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
     });
     const [startOffset, setStartOffset] = useState(1);
 
-    const schedule = useMemo(() => {
-        if (!clips) return [];
-        return clips.map((clip, i) => {
+    // Where the clips go. 'uploadpost' is the original path and stays the
+    // default; 'instagram' is the self-hosted poster (own Meta app, B2 +
+    // Supabase), offered only when the server says it is configured.
+    const [destination, setDestination] = useState('uploadpost');
+    const [igAvailable, setIgAvailable] = useState(false);
+    // 'slots' books the next free posting slots on the poster; 'explicit' uses
+    // the time + start-day grid below, which is what Upload-Post always uses.
+    const [timing, setTiming] = useState('slots');
+
+    // A zone the picker does not list is still a real zone, and dropping it
+    // would put the old 'UTC' fallback back by another route — a <select>
+    // whose value matches no option renders blank and reads as "nothing
+    // chosen". Offer it instead.
+    const timezoneOptions = useMemo(() => (
+        TIMEZONES.some(t => t.value === timezone)
+            ? TIMEZONES
+            : [{ value: timezone, label: timezone }, ...TIMEZONES]
+    ), [timezone]);
+
+    // Which clips actually get published. Everything is on by default, which
+    // is the old behaviour of this modal — it published the whole job with no
+    // say in it.
+    const [selected, setSelected] = useState(() => new Set());
+
+    // clips?.length, not clips: the array is rebuilt on every parent render,
+    // so depending on its identity would reset the tick boxes under the user
+    // mid-edit.
+    React.useEffect(() => {
+        if (!isOpen) return;
+        setSelected(new Set(Array.from({ length: clips?.length || 0 }, (_, i) => i)));
+    }, [isOpen, clips?.length]);
+
+    const toggleClip = (index) => setSelected((prev) => {
+        const next = new Set(prev);
+        next.has(index) ? next.delete(index) : next.add(index);
+        return next;
+    });
+
+    // EVERY clip is rendered, ticked or not — a list that hid the unticked ones
+    // would give the user no way to put one back. Only the ticked ones take a
+    // date or a slot, and `position` is their rank among those: deselecting
+    // the third clip must close the gap, not leave a hole in the schedule.
+    //
+    // `index` (which clip) and `position` (where it lands) were the same number
+    // until now, and the two uses have to stay apart: `index` is what the API
+    // is told to publish, `position` is what indexes the progress results.
+    const rows = useMemo(() => {
+        let position = 0;
+        return (clips || []).map((clip, index) => {
+            if (!selected.has(index)) {
+                return { clip, index, selected: false, position: null, date: null };
+            }
             const date = new Date();
-            date.setDate(date.getDate() + startOffset + i);
+            date.setDate(date.getDate() + startOffset + position);
             date.setHours(0, 0, 0, 0);
-            return { clip, index: i, date };
+            return { clip, index, selected: true, position: position++, date };
         });
-    }, [clips, startOffset]);
+    }, [clips, startOffset, selected]);
+
+    const schedule = useMemo(() => rows.filter((r) => r.selected), [rows]);
 
     const [scheduling, setScheduling] = useState(false);
     const [progress, setProgress] = useState({ current: 0, total: 0, results: [] });
@@ -108,15 +186,113 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
         prevOpen.current = isOpen;
     }, [isOpen]);
 
+    // Ask once per open whether the self-hosted poster is wired up. Showing a
+    // destination the server cannot honour would just move the failure to the
+    // schedule button.
+    React.useEffect(() => {
+        if (!isOpen) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await apiFetch('/api/instagram/config');
+                if (!res.ok) return;
+                const cfg = await res.json();
+                if (!cancelled) setIgAvailable(Boolean(cfg.configured));
+            } catch { /* not configured is the normal case */ }
+        })();
+        return () => { cancelled = true; };
+    }, [isOpen]);
+
     if (!isOpen) return null;
 
+    const toInstagram = destination === 'instagram' && igAvailable;
     const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
 
-    // Managed (cloud plan/trial) users post with the server-side key — no BYOK needed
-    const canPost = isManaged || (uploadPostKey && uploadUserId);
+    // Managed (cloud plan/trial) users post with the server-side key — no BYOK
+    // needed. The self-hosted poster uses the server's own B2 + Supabase
+    // credentials, so it needs no key from the browser at all.
+    const canPost = toInstagram || isManaged || (uploadPostKey && uploadUserId);
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const wallClock = (date) =>
+        `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${time}:00`;
+
+    // The self-hosted poster takes the whole batch in ONE request, unlike
+    // Upload-Post which is one call per clip. That is what lets it hand out
+    // consecutive posting slots: asking for "the next free slot" three times
+    // in parallel would return the same instant three times.
+    const handleScheduleInstagram = async () => {
+        const total = schedule.length;
+        setScheduling(true);
+        setDone(false);
+        setProgress({ current: 0, total, results: [] });
+
+        const body = {
+            job_id: jobId,
+            timezone,
+            post_now: timing === 'now',
+            clips: schedule.map(({ clip, index, date }) => ({
+                clip_index: index,
+                caption: clip.video_description_for_instagram
+                    || clip.video_description_for_tiktok || '',
+                // Omitted in slot mode, so the poster picks the time.
+                ...(timing === 'explicit' ? { scheduled_local: wallClock(date) } : {}),
+            })),
+        };
+
+        try {
+            const res = await apiFetch('/api/instagram/schedule', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!res.ok) throw new Error(await res.text());
+            const started = await res.json();
+
+            // The upload runs in the background because a clip is tens of
+            // megabytes over a home upstream — minutes, not seconds. Polling is
+            // what stops the modal looking hung, which is what previously made
+            // people press the button again and start a second upload of the
+            // same clips alongside the first.
+            let answer = null;
+            for (;;) {
+                await new Promise(r => setTimeout(r, 2000));
+                const poll = await apiFetch(`/api/instagram/schedule/${started.task_id}`);
+                if (!poll.ok) throw new Error(await poll.text());
+                const state = await poll.json();
+                setProgress(p => ({ ...p, current: state.done || 0, total: state.total || total }));
+                if (state.status === 'failed') throw new Error(state.error || 'upload failed');
+                if (state.status === 'done') { answer = state.result; break; }
+            }
+
+            // Map the server's per-clip verdicts back onto the rows, which are
+            // keyed by position in `schedule`, not by clip_index.
+            const byIndex = new Map(
+                (answer.results || []).map(r => [r.clip_index, r]));
+            const results = schedule.map(({ index }, i) => {
+                const r = byIndex.get(index);
+                return {
+                    index: i,
+                    success: Boolean(r && r.ok),
+                    error: r && !r.ok ? r.error : undefined,
+                    scheduled_at: r?.scheduled_at,
+                };
+            });
+            setProgress({ current: total, total, results });
+        } catch (e) {
+            setProgress({
+                current: total, total,
+                results: schedule.map((_, i) => ({ index: i, success: false, error: e.message })),
+            });
+        }
+
+        setDone(true);
+        setScheduling(false);
+    };
 
     const handleScheduleAll = async () => {
         if (!canPost) return;
+        if (toInstagram) return handleScheduleInstagram();
         if (selectedPlatforms.length === 0) return;
 
         setScheduling(true);
@@ -130,8 +306,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
 
             // Build local datetime string: "2026-04-06T12:00:00"
             // Upload-Post accepts this + timezone IANA parameter
-            const pad = (n) => String(n).padStart(2, '0');
-            const scheduledDate = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${time}:00`;
+            const scheduledDate = wallClock(date);
 
             const payload = {
                 job_id: jobId,
@@ -184,7 +359,8 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
             {!done ? (
                 <button
                     onClick={handleScheduleAll}
-                    disabled={scheduling || !canPost || selectedPlatforms.length === 0}
+                    disabled={scheduling || !canPost || schedule.length === 0
+                        || (!toInstagram && selectedPlatforms.length === 0)}
                     className="btn-primary flex-1"
                 >
                     {scheduling ? (
@@ -195,19 +371,21 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                     ) : (
                         <>
                             <Calendar size={16} />
-                            schedule {clips?.length || 0} clips
+                            {timing === 'now' && toInstagram ? 'post' : 'schedule'} {schedule.length} clip{schedule.length === 1 ? '' : 's'}
                         </>
                     )}
                 </button>
             ) : (
                 <a
-                    href="https://app.upload-post.com/calendar"
+                    href={toInstagram
+                        ? (import.meta.env.VITE_IG_POSTER_URL || 'https://postschedule.netlify.app')
+                        : 'https://app.upload-post.com/calendar'}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="btn-primary flex-1 no-underline"
                 >
                     <ExternalLink size={16} />
-                    view calendar
+                    {toInstagram ? 'view queue' : 'view calendar'}
                 </a>
             )}
         </div>
@@ -222,7 +400,37 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
             size="md"
             footer={footer}
         >
-            <p className="readout mb-4">{clips?.length || 0} CLIPS · 1/DAY</p>
+            <div className="mb-4 flex items-center justify-between gap-2">
+                <p className="readout">
+                    {schedule.length} OF {clips?.length || 0} CLIPS · {!toInstagram ? '1/DAY' : timing === 'now' ? 'PUBLISHING NOW' : timing === 'slots' ? 'NEXT FREE SLOTS' : '1/DAY'}
+                </p>
+                {!scheduling && !done && (clips?.length || 0) > 1 && (
+                    <button
+                        type="button"
+                        onClick={() => setSelected(schedule.length === clips.length
+                            ? new Set()
+                            : new Set(clips.map((_, i) => i)))}
+                        className="btn-quiet px-2 py-1 text-xs lowercase"
+                    >
+                        {schedule.length === clips.length ? 'select none' : 'select all'}
+                    </button>
+                )}
+            </div>
+
+            {/* Destination — only shown once there is a choice to make. */}
+            {igAvailable && (
+                <div className="mb-5">
+                    <label className="eyebrow block mb-2">destination</label>
+                    <SegmentedControl
+                        options={[
+                            { value: 'uploadpost', label: 'Upload-Post', disabled: scheduling },
+                            { value: 'instagram', label: 'Instagram', icon: <Instagram size={16} />, disabled: scheduling },
+                        ]}
+                        value={destination}
+                        onChange={setDestination}
+                    />
+                </div>
+            )}
 
             {!canPost && (
                 <div className="mb-4 p-3 bg-warn/10 text-warn text-xs rounded-input flex items-start gap-2">
@@ -231,8 +439,49 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                 </div>
             )}
 
+            {/* Timing — the poster can place clips on its own posting slots, so
+                the time/day grid below is only one of two ways to schedule. */}
+            {toInstagram && (
+                <div className="mb-5">
+                    <label className="eyebrow block mb-2">timing</label>
+                    <SegmentedControl
+                        options={[
+                            { value: 'now', label: 'post now', disabled: scheduling },
+                            { value: 'slots', label: 'next free slots', disabled: scheduling },
+                            { value: 'explicit', label: 'pick a time', disabled: scheduling },
+                        ]}
+                        value={timing}
+                        onChange={setTiming}
+                    />
+                    {timing === 'slots' && (
+                        <p className="text-xs text-muted mt-2 lowercase">
+                            times come from the posting slots set in your instagram poster.
+                        </p>
+                    )}
+                    {timing === 'now' && (
+                        schedule.length > 1 ? (
+                            /* Instagram allows 50 posts a day, so this is not a
+                               limit problem — it is a feed problem. Every clip
+                               goes out on the poster's next cron pass, so N
+                               clips means N reels within a few minutes. */
+                            <div className="mt-2 p-3 bg-warn/10 text-warn text-xs rounded-input flex items-start gap-2">
+                                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                                <div>
+                                    all {schedule.length} clips publish within a few minutes of
+                                    each other. use slots to space them out.
+                                </div>
+                            </div>
+                        ) : (
+                            <p className="text-xs text-muted mt-2 lowercase">
+                                publishes on the poster's next check, within a minute.
+                            </p>
+                        )
+                    )}
+                </div>
+            )}
+
             {/* Time + Timezone */}
-            <div className="mb-5 grid grid-cols-2 gap-3">
+            <div className={`mb-5 grid grid-cols-2 gap-3${toInstagram && timing !== 'explicit' ? ' hidden' : ''}`}>
                 <div>
                     <label className="eyebrow block mb-2">time</label>
                     <input
@@ -251,7 +500,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                         disabled={scheduling}
                         className="input-field appearance-none cursor-pointer"
                     >
-                        {TIMEZONES.map(tz => (
+                        {timezoneOptions.map(tz => (
                             <option key={tz.value} value={tz.value}>{tz.label}</option>
                         ))}
                     </select>
@@ -259,7 +508,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
             </div>
 
             {/* Start day offset */}
-            <div className="mb-5 flex flex-wrap items-center justify-between gap-2">
+            <div className={`mb-5 flex flex-wrap items-center justify-between gap-2${toInstagram && timing !== 'explicit' ? ' hidden' : ''}`}>
                 <span className="eyebrow">start from</span>
                 <div className="flex items-center gap-2">
                     <button
@@ -288,10 +537,27 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
 
             {/* Calendar list */}
             <div className="mb-5 border-y border-rule divide-y divide-rule">
-                {schedule.map(({ clip, index, date }) => (
-                    <div key={index} className="flex items-center gap-3 py-2.5">
+                {rows.map(({ clip, index, date, selected: isOn, position }) => {
+                    // Results are positional over the SELECTED clips, so an
+                    // unticked row has no result and a ticked one looks its own
+                    // up by `position`, never by `index`.
+                    const outcome = position === null ? undefined : progress.results[position];
+                    const idle = !scheduling && !done;
+                    return (
+                    <div
+                        key={index}
+                        onClick={idle ? () => toggleClip(index) : undefined}
+                        className={`flex items-center gap-3 py-2.5${idle ? ' cursor-pointer' : ''}${isOn ? '' : ' opacity-40'}`}
+                    >
                         <div className="w-24 shrink-0">
-                            <span className="readout">{getDayLabel(date)} · {formatDate(date)}</span>
+                            <span className="readout">
+                                {!isOn ? 'skipped'
+                                    : toInstagram && timing !== 'explicit'
+                                        ? (outcome?.scheduled_at
+                                            ? `${getDayLabel(new Date(outcome.scheduled_at))} · ${formatDate(new Date(outcome.scheduled_at))}`
+                                            : (timing === 'now' ? 'now' : `slot ${position + 1}`))
+                                        : `${getDayLabel(date)} · ${formatDate(date)}`}
+                            </span>
                         </div>
 
                         <div className="flex-1 min-w-0">
@@ -299,30 +565,50 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                                 {clip.video_title_for_youtube_short || 'Viral Short'}
                             </div>
                             <div className="readout mt-0.5 truncate">
-                                {time} · {TIMEZONES.find(t => t.value === timezone)?.label || timezone}
+                                {!isOn ? 'not scheduled'
+                                    : toInstagram && timing !== 'explicit'
+                                        ? (outcome?.scheduled_at
+                                            ? new Date(outcome.scheduled_at)
+                                                .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                            : (timing === 'now' ? 'on the next check' : 'next free slot'))
+                                        : `${time} · ${timezoneOptions.find(t => t.value === timezone)?.label || timezone}`}
                             </div>
                         </div>
 
                         <div className="shrink-0">
-                            {progress.results[index]?.success === true && (
-                                <CheckCircle size={16} className="text-ok" />
-                            )}
-                            {progress.results[index]?.success === false && (
-                                <AlertCircle size={16} className="text-danger" />
-                            )}
-                            {scheduling && progress.current === index && (
-                                <Loader2 size={16} className="text-brass animate-spin" />
-                            )}
-                            {!scheduling && progress.results[index] === undefined && (
-                                <Circle size={16} className="text-muted" />
+                            {/* Idle: a tick box. Running: the status of this
+                                clip. The old build showed a hollow circle while
+                                idle, which read as an empty checkbox and is
+                                exactly the control this now is. */}
+                            {idle ? (
+                                isOn
+                                    ? <CheckCircle size={16} className="text-brass" />
+                                    : <Circle size={16} className="text-muted" />
+                            ) : (
+                                <>
+                                    {outcome?.success === true && (
+                                        <CheckCircle size={16} className="text-ok" />
+                                    )}
+                                    {outcome?.success === false && (
+                                        <AlertCircle size={16} className="text-danger" />
+                                    )}
+                                    {scheduling && progress.current === position && (
+                                        <Loader2 size={16} className="text-brass animate-spin" />
+                                    )}
+                                    {isOn && outcome === undefined && !scheduling && (
+                                        <Circle size={16} className="text-muted" />
+                                    )}
+                                </>
                             )}
                         </div>
                     </div>
-                ))}
+                    );
+                })}
             </div>
 
-            {/* Platforms */}
-            <div className="mb-5">
+            {/* Platforms — the self-hosted poster publishes to one Instagram
+                account and nothing else, so there is nothing to choose. */}
+            <div className={`mb-5${toInstagram ? ' hidden' : ''}`}>
                 <label className="eyebrow block mb-2">platforms</label>
                 <SegmentedControl
                     multi
@@ -340,13 +626,17 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                 this modal writes no captions of its own either (it sends the
                 clip's generated title/description), and tiktok keeps none of
                 them on a draft. Say it before the button, not after. */}
-            {platforms.tiktok && !scheduling && !done && <TikTokDraftNotice />}
+            {!toInstagram && platforms.tiktok && !scheduling && !done && <TikTokDraftNotice />}
 
             {/* Progress bar */}
             {(scheduling || done) && (
                 <div className="mb-1">
                     <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs text-muted lowercase">{scheduling ? 'scheduling...' : 'complete'}</span>
+                        <span className="text-xs text-muted lowercase">
+                            {!scheduling ? 'complete'
+                                : toInstagram ? `uploading clip ${Math.min(progress.current + 1, progress.total)} of ${progress.total}...`
+                                : 'scheduling...'}
+                        </span>
                         <span className="readout">{progress.current}/{progress.total}</span>
                     </div>
                     <div className="w-full h-1.5 bg-paper3 rounded-full overflow-hidden">

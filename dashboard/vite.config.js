@@ -19,6 +19,20 @@ export default defineConfig({
       'openshorts.app',
       'www.openshorts.app'
     ],
+    // The dev container bind-mounts ./dashboard from the host, and inotify
+    // events do NOT cross that boundary on Docker Desktop for Windows or
+    // macOS. Without polling, Vite never learns a file changed: it keeps
+    // serving the transform it cached at startup, HMR never fires, and a
+    // browser refresh returns the same stale module. That failure is silent
+    // and costs an edit-debug cycle every time, because the file on disk and
+    // inside the container is plainly correct — only what Vite SERVES is old
+    // (curl the module path to see it). Polling is the standard cost of
+    // developing on a bind mount; VITE_POLL=0 turns it off on Linux, where
+    // inotify works natively.
+    watch: process.env.VITE_POLL === '0' ? undefined : {
+      usePolling: true,
+      interval: 300,
+    },
     proxy: {
       '/api': { target: backend, changeOrigin: true },
       '/videos': { target: backend, changeOrigin: true },

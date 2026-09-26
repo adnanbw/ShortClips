@@ -92,7 +92,8 @@ def gemini(monkeypatch):
     return seen
 
 
-def test_rewrites_hook_and_title_and_keeps_the_originals(gemini):
+def test_rewrites_hook_and_title_and_keeps_the_originals(gemini, monkeypatch):
+    monkeypatch.setenv("METADATA_LANGUAGE", "speaker")
     clip = {"viral_hook_text": "He automatizado la creación de mis clips con IA.",
             "video_title_for_youtube_short": "Clips con IA",
             "layout_ranges": SCREEN}
@@ -108,7 +109,23 @@ def test_rewrites_hook_and_title_and_keeps_the_originals(gemini):
     assert len(gemini["frames"]) == 3
     assert "añadimos el conector" in gemini["prompt"]
     assert "He automatizado" in gemini["prompt"]  # the model sees the current hook
-    assert "TRANSCRIPT_LANGUAGE: es" in gemini["prompt"]
+    assert "WRITE_IN (the language BOTH fields must be written in): es"         in gemini["prompt"]
+
+
+def test_the_rewrite_obeys_the_english_metadata_rule(gemini, monkeypatch):
+    """This stage REWRITES the burned hook and the title, so if it were still
+    told "the transcript's language" it would put the source script back onto
+    the video after meaningful_metadata had taken it off — and the hook is
+    drawn by PIL with one Latin-only font, which renders the rest as boxes."""
+    monkeypatch.delenv("METADATA_LANGUAGE", raising=False)
+    transcript = {"language": "hi", "segments": [
+        {"start": 100, "end": 110, "text": "यह क्लिप"}]}
+
+    hg.reground("clip.mp4", {"viral_hook_text": "old", "layout_ranges": SCREEN},
+                transcript, 100, 130)
+
+    assert "WRITE_IN (the language BOTH fields must be written in): English"         in gemini["prompt"]
+    assert "hi" not in gemini["prompt"].split("WRITE_IN")[1].splitlines()[0]
 
 
 def test_without_a_gemini_key_the_transcript_hook_stands(monkeypatch):

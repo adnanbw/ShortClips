@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 
+import transliterate as _translit
 from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY,
                           METADATA_SCRUB)
 
@@ -112,6 +113,14 @@ def merge_continuation_words(words):
         text = word.get("word", "")
         if merged and isinstance(text, str) and text and not text.startswith(" "):
             prev = merged[-1]
+            # The Latin spelling (transliterate.annotate_transcript) has to be
+            # merged alongside, or the fragment's script leaks back into a
+            # caption whose base word was already romanised. A side without one
+            # contributes its own text, which is what an already-Latin fragment
+            # like "-Kanal." should contribute anyway.
+            if "latin" in prev or "latin" in word:
+                prev["latin"] = (f"{prev.get('latin') or prev.get('word', '')}"
+                                 f"{word.get('latin') or text}")
             prev["word"] = f"{prev.get('word', '')}{text}"
             if word.get("end") is not None:
                 prev["end"] = word["end"]
@@ -270,7 +279,12 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
     words = []
     for word_info in flat_words:
         if word_info.get('end', 0) > clip_start and word_info.get('start', 0) < clip_end:
-            cleaned_word = _normalize_subtitle_word(word_info.get('word', ''))
+            # Burned text is Latin whenever a Latin spelling exists, because
+            # the caption font (Anton) and the hook renderer only have Latin
+            # glyphs. Only the DISPLAY is romanised — every judge upstream
+            # still reads the original script off the segment text.
+            cleaned_word = _normalize_subtitle_word(
+                _translit.caption_text(word_info))
             if not cleaned_word:
                 continue
             words.append({

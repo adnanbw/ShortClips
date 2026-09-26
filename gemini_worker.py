@@ -99,7 +99,7 @@ meaning is on the screen, not in the face.
 1. `on_screen`: one line naming what is shown — the app, window, product,
    document, code, chart or on-screen text — as specifically as the frames
    allow (read visible titles and labels).
-2. `viral_hook_text`: max 10 words, in TRANSCRIPT_LANGUAGE. It MUST mention
+2. `viral_hook_text`: max 10 words, in WRITE_IN. It MUST mention
    the thing you named in `on_screen` (or the action being done to it: set
    up, connect, compare, fix, type) AND keep the strongest concrete fact of
    the clip: a number, a multiplier, a price, a name ("7x faster", "$136 a
@@ -107,12 +107,12 @@ meaning is on the screen, not in the face.
    summary of the video's general topic, never a slogan that would fit any
    clip of this video, never drop a figure for a vaguer phrase.
 3. `video_title_for_youtube_short`: max 100 chars, same rule, in
-   TRANSCRIPT_LANGUAGE, no fake claims.
+   WRITE_IN, no fake claims.
 
 The current hook and title below were written WITHOUT seeing the frames and
 are the kind of topic summary you must replace. Do not reuse their wording.
 
-TRANSCRIPT_LANGUAGE: {language}
+WRITE_IN (the language BOTH fields must be written in): {language}
 CURRENT_HOOK (to replace): {current_hook}
 CURRENT_TITLE (to replace): {current_title}
 TRANSCRIPT:

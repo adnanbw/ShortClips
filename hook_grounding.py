@@ -157,7 +157,13 @@ def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
         frames = frames_at(clip_path, times)
         if not frames:
             return None
-        language = str((transcript or {}).get("language") or "unknown")
+        # Same policy as meaningful_metadata: this stage REWRITES the burned
+        # hook and the title, so telling it "the transcript's language" would
+        # undo the English rule that keeps those two fields renderable in a
+        # Latin-only font.
+        from meaningful_metadata import metadata_language_target
+        language = metadata_language_target(
+            str((transcript or {}).get("language") or "unknown"))
         prompt = gemini_worker.GROUNDED_HOOK_PROMPT.format(
             language=language,
             current_hook=clip.get("viral_hook_text") or "",
