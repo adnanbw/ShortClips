@@ -441,6 +441,25 @@ function App() {
     setActiveTab('dashboard');
   };
 
+  // Open a finished job from History (self-host). restoreProject above pulls a
+  // project back out of R2; here the clips never left the machine, so this is
+  // just the results view pointed at a job_id that /api/status already serves
+  // from disk. noSource is set because the source video ages out on its own
+  // clock (SOURCE_RETENTION_SECONDS) and may be gone while the clips remain.
+  const openJob = async (id) => {
+    const data = await apiJson(`/api/status/${id}`);
+    flushClipState();
+    setProjectState(null);
+    setNoSource(true);
+    setJobId(id);
+    setResults(data.result || null);
+    setLogs(['📂 Opened from history.']);
+    setProcessingMedia(null);
+    setQualityGate(null);
+    setStatus('complete');
+    setActiveTab('dashboard');
+  };
+
   // Apply one subtitle style to every clip of the job, sequentially.
   const handleBulkSubtitles = async (options) => {
     const clips = results?.clips || [];
@@ -960,7 +979,10 @@ function App() {
     { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
+    // Cloud needs a signed-in user (the library is per-account, in R2).
+    // Self-host has one user and reads the jobs straight off disk, so
+    // hiding the tab there only hid work that was sitting in output/.
+    ...(!billingEnabled || isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '07', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
@@ -1679,7 +1701,7 @@ function App() {
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
-                <HistoryTab onReopenProject={restoreProject} />
+                <HistoryTab onReopenProject={restoreProject} onOpenJob={openJob} />
               </div>
             </div>
           )}

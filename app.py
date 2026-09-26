@@ -2546,6 +2546,79 @@ def _presented_status(job_id, job):
     return job['status']
 
 
+@app.get("/api/jobs")
+async def list_jobs(request: Request):
+    """Every finished job still on disk, newest first.
+
+    Self-host has no library: `/api/history` and `/api/projects` live in
+    `cloud/videos.py` and read the R2 archive, so with BILLING_ENABLED off the
+    History tab has nothing to call and was hidden outright. But the jobs are
+    not gone — `_recover_jobs_from_disk` already rebuilds every one of them from
+    `output/<job_id>/*_metadata.json` at startup, and `/api/status/{job_id}`
+    already serves them. The only thing missing was a way to ENUMERATE them.
+
+    So this needs no database and no new storage: it reads the same directories
+    the recovery pass does. A job whose clips have been swept by
+    JOB_RETENTION_SECONDS simply stops appearing, which is the truth.
+    """
+    user = await _user_from_request(request)
+    items = []
+    try:
+        entries = os.listdir(OUTPUT_DIR)
+    except FileNotFoundError:
+        entries = []
+
+    for job_id in entries:
+        job_path = os.path.join(OUTPUT_DIR, job_id)
+        if not os.path.isdir(job_path) or job_id == "thumbnails":
+            continue
+        metas = glob.glob(os.path.join(job_path, "*_metadata.json"))
+        if not metas:
+            continue   # never finished analysis; nothing to reopen
+
+        # Ownership: cloud keeps several users' jobs in one OUTPUT_DIR, so the
+        # listing is filtered the same way every other job endpoint is. Self-host
+        # writes no .owner file and has one user, so nothing is hidden there.
+        if BILLING_ENABLED:
+            owner = None
+            owner_path = os.path.join(job_path, ".owner")
+            try:
+                if os.path.exists(owner_path):
+                    with open(owner_path) as f:
+                        raw = f.read().strip()
+                    owner = int(raw) if raw.isdigit() else (raw or None)
+            except Exception:
+                owner = None
+            if owner is None or user is None or str(owner) != str(user.id):
+                continue
+
+        try:
+            with open(metas[0], 'r') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        base_name = os.path.basename(metas[0]).replace('_metadata.json', '')
+        clips = data.get('shorts') or []
+        items.append({
+            "job_id": job_id,
+            # The source video's title, which is what the job dir is named
+            # after — the only human-readable label a finished job carries.
+            "title": base_name.replace('_', ' ').strip(),
+            "clip_count": len(clips),
+            "created_at": datetime.fromtimestamp(
+                os.path.getmtime(metas[0]), tz=timezone.utc).isoformat(),
+            "language": (data.get('transcript') or {}).get('language'),
+            "selector": data.get('selector'),
+            # First clip's rendered file, for a thumbnail in the list.
+            "preview_url": (
+                f"/videos/{job_id}/{_canonical_clip_file(job_path, base_name, 0)}"
+                if clips else None),
+        })
+
+    items.sort(key=lambda j: j["created_at"], reverse=True)
+    return {"jobs": items}
+
+
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str, request: Request):
     job = jobs.get(job_id)
