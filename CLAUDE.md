@@ -706,7 +706,15 @@ Instagram account and Tarun Ratnani listed two: his own and the comedy club he
 performed at. A regex cannot separate those; the words beside them can
 ("Follow me" vs "Venue"), so each candidate is stored with ~90 characters of
 surrounding text and that is what the model is shown. One candidate is taken
-without a model call at all.
+without a model call at all — which is the common case, and the reason the
+whole feature is usually free.
+
+**Disambiguating is opt-in (`CREDIT_PICK_HANDLE=1`).** This pipeline already
+spends heavily on Gemini per video — candidate finder, critic, opening guard,
+metadata, transliteration — and one more call for a nicety is not obviously
+worth a free-tier quota. Off, a description listing several accounts credits
+the creator by name instead. It costs at most ONE call per schedule request
+when enabled, not one per clip.
 
 Every unresolved case degrades to naming the creator in words, which is still
 attribution and tags nobody: no candidates, several candidates with no Gemini

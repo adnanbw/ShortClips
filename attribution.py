@@ -180,7 +180,20 @@ def pick_handle(attr: Dict[str, Any], platform: str,
     if not candidates:
         return None
     if len(candidates) == 1:
+        # Nothing to disambiguate, so nothing to ask. This is the common case:
+        # of two real videos measured, one listed a single account.
         return candidates[0]["handle"]
+
+    # Several accounts, and telling them apart needs to read the words around
+    # them. That is a Gemini call, and it is OPT-IN: this pipeline already
+    # spends heavily on Gemini per video (candidate finder, critic, opening
+    # guard, metadata, transliteration), and one more call for a nicety is not
+    # obviously worth a free-tier quota. Off, the credit names the creator in
+    # words — which tags nobody and is never wrong.
+    if os.environ.get("CREDIT_PICK_HANDLE", "").strip() not in ("1", "true", "yes"):
+        print(f"   ℹ️ {len(candidates)} {platform} accounts in the description; "
+              f"crediting by name (set CREDIT_PICK_HANDLE=1 to pick one).")
+        return None
 
     api_key = api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:

@@ -140,9 +140,34 @@ def test_no_candidates_is_no_handle():
 
 def test_two_candidates_without_a_key_credits_nobody(monkeypatch):
     """Picking the first would be a coin flip with a stranger's name on it."""
+    monkeypatch.setenv("CREDIT_PICK_HANDLE", "1")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     data = attr.from_info({"uploader": "Tarun Ratnani", "description": TARUN})
     assert attr.pick_handle(data, "instagram") is None
+
+
+def test_disambiguating_is_opt_in_and_costs_nothing_by_default(monkeypatch):
+    """This pipeline already spends heavily on Gemini per video, so one more
+    call for a nicety is not automatic. Off, the credit names the creator in
+    words — which tags nobody and is never wrong."""
+    monkeypatch.delenv("CREDIT_PICK_HANDLE", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    import google.genai as genai
+
+    def explode(*a, **k):
+        pytest.fail("no model call may happen with CREDIT_PICK_HANDLE unset")
+
+    monkeypatch.setattr(genai, "Client", explode)
+    data = attr.from_info({"uploader": "Tarun Ratnani", "description": TARUN})
+    assert attr.pick_handle(data, "instagram") is None
+
+
+def test_one_candidate_is_used_even_with_picking_off(monkeypatch):
+    """There is nothing to disambiguate, so the opt-in never applies — and the
+    common case keeps its @mention for free."""
+    monkeypatch.delenv("CREDIT_PICK_HANDLE", raising=False)
+    data = attr.from_info({"uploader": "Sharon Verma", "description": SHARON})
+    assert attr.pick_handle(data, "instagram") == "sharonverma"
 
 
 class FakeGemini:
@@ -173,6 +198,7 @@ def _fake_genai(monkeypatch, choice):
     fake = FakeGemini(choice)
     fake.install(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("CREDIT_PICK_HANDLE", "1")
     return fake
 
 
@@ -206,6 +232,7 @@ def test_an_index_outside_the_list_is_refused(monkeypatch, choice):
 def test_a_model_error_credits_by_name_instead(monkeypatch):
     pytest.importorskip("google.genai")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("CREDIT_PICK_HANDLE", "1")
     import google.genai as genai
 
     class Boom:
