@@ -789,22 +789,42 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
+    # The cookies file goes to a PRIVATE TEMP FILE, not into /app.
+    #
+    # It used to be written to a hardcoded '/app/cookies.txt', which is inside
+    # the bind-mounted source tree, and that is wrong twice over. It is a live
+    # YouTube session sitting in a git working tree — untracked, but one
+    # `git add -A` from a public repo. And /app belongs to whoever owns the
+    # checkout: after the container started running as the host's uid, the
+    # cookies.txt left behind by the previous user could no longer be
+    # overwritten, so the write failed, `cookies_path` fell back to None, and
+    # yt-dlp ran ANONYMOUSLY. The job then died on "Sign in to confirm you're
+    # not a bot" — which reads as YouTube blocking the server, when in fact
+    # the credentials were simply never loaded.
+    #
+    # /tmp is container-local, always writable whatever uid is in play, and
+    # mkstemp creates the file 0600 so the session is not world-readable.
+    cookies_path = None
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
     if cookies_env:
         print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
         try:
-            with open(cookies_path, 'w') as f:
+            import tempfile
+            fd, cookies_path = tempfile.mkstemp(prefix="ytcookies_", suffix=".txt")
+            with os.fdopen(fd, "w") as f:
                 f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 # Never print file CONTENT here: with a headerless cookies
-                 # blob this would leak live YouTube session cookies to logs.
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
+            # Never print file CONTENT here: with a headerless cookies blob
+            # this would leak live YouTube session cookies to logs.
+            print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
         except Exception as e:
+            # Loud, because the consequence is silent otherwise: an anonymous
+            # download from a datacenter IP is bot-checked, and the job fails
+            # blaming YouTube rather than the missing cookies.
             print(f"⚠️ Failed to write cookies file: {e}")
+            print("⚠️ Continuing WITHOUT cookies — an anonymous download from a "
+                  "datacenter IP is likely to be refused as a bot.")
             cookies_path = None
     else:
-        cookies_path = None
         print("⚠️ YOUTUBE_COOKIES env var not found.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset

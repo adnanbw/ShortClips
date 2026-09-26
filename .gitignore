@@ -46,3 +46,8 @@ skills-lock.json
 # Cloud env example kept local only (avoid leaking infra hints)
 .env.cloud.example
 .worktrees
+
+# A live YouTube session, written at download time. Never in the tree now
+# (main.py uses a 0600 temp file) but older checkouts have one lying around.
+cookies.txt
+*cookies.txt
