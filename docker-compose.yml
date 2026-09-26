@@ -2,6 +2,26 @@ services:
   backend:
     build: .
     container_name: openshorts-backend
+    # The image creates a non-root `appuser` and chowns /app to it, and then
+    # this file bind-mounts the host checkout straight over that directory.
+    # On Docker Desktop (Windows/macOS) ownership is synthesised and every
+    # path looks writable, so the conflict is invisible. On real Linux the
+    # ownership is real: /app belongs to the HOST user, appuser is a system
+    # account (uid 999), and app.py dies on its second line with
+    # `PermissionError: [Errno 13] Permission denied: 'uploads'` before
+    # uvicorn ever imports the app — a crash loop with no obvious cause.
+    #
+    # Running as the host's own uid is what makes a bind mount writable, and
+    # 1000 is the first non-system uid on Ubuntu, Debian and Fedora alike.
+    # HOST_UID/HOST_GID override it for a host where that is not true
+    # (`id -u` to check); Docker Desktop ignores the whole question.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      # useradd gave appuser HOME=/app. Overriding the uid means there is no
+      # passwd entry for the process any more, so HOME would be unset and
+      # ultralytics, matplotlib and fontconfig would each try to write their
+      # caches to / and fail. Point it back at the writable mount.
+      - HOME=/app
     ports:
       - "8000:8000"
     volumes:
