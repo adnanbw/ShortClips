@@ -15,9 +15,23 @@ export default defineConfig({
   // llms.txt. See vite-plugin-seo.js.
   plugins: [react(), seo()],
   server: {
+    // Vite refuses any request whose Host header is not listed here (a DNS
+    // rebinding defence), and the refusal is a bare text page that mentions
+    // neither Vite nor the dev server — so reaching the dashboard by a new
+    // name looks like the tunnel or the proxy is broken, not the bundler.
+    //
+    // `.ts.net` is every Tailscale MagicDNS name. Listing the whole suffix
+    // rather than one host is deliberate: those names only resolve, and are
+    // only routable, inside the tailnet that owns them, so this grants
+    // nothing to the public internet — and it survives renaming the machine
+    // or adding a second one. VITE_ALLOWED_HOSTS (comma-separated) adds any
+    // other domain a deployment is served from.
     allowedHosts: [
       'openshorts.app',
-      'www.openshorts.app'
+      'www.openshorts.app',
+      '.ts.net',
+      ...(process.env.VITE_ALLOWED_HOSTS || '')
+        .split(',').map((h) => h.trim()).filter(Boolean),
     ],
     // The dev container bind-mounts ./dashboard from the host, and inotify
     // events do NOT cross that boundary on Docker Desktop for Windows or
