@@ -527,6 +527,30 @@ whether `transcript.json` exists before believing the exception. The Linux
 container is UTF-8 and never hit this; only the host-side
 `tools/kaggle_setup.py test` did.
 
+**Queuing and running get different budgets.** `KAGGLE_TIMEOUT_SECONDS` (1800)
+used to cover both, and on a real job that meant 30 minutes of polling a
+`QUEUED` kernel followed by the local transcription that could have started
+immediately. `QUEUED` means no GPU was allocated and nothing is happening;
+Kaggle publishes no queue position or estimate, so eight minutes of it is
+indistinguishable from never, and waiting cannot make it start sooner.
+`KAGGLE_QUEUE_TIMEOUT_SECONDS` (480) applies until the status leaves
+`QUEUED`/`NEW_SCRIPT`, after which the long budget takes over because giving
+up on a decoding GPU throws away nearly-finished work. The flag is **latched**
+— a status call that reports `QUEUED` again after `RUNNING` must not re-arm
+the short budget — and the queue budget is clamped to the overall one, so
+lowering only `KAGGLE_TIMEOUT_SECONDS` cannot produce a *longer* wait. The
+clock starts at DISPATCH, before the local download, which is most of the
+point: a job spends its first ~30s downloading and only then asks.
+
+An abandoned kernel is **not cancelled**, and that is the API's limit rather
+than a choice. kagglesdk exposes `CancelKernelSession`, but its endpoint is
+`/api/v1/kernels/cancel-session/{kernel_session_id}` and nothing hands out
+that id — `kernels_status` returns only `status` + `failureMessage`, and
+`kernels_push` returns `kernel_id`, which identifies the KERNEL, not the
+session. Passing a kernel id to a global session-cancel endpoint could cancel
+someone else's session, so it is not guessed. The cost of leaving it is a few
+minutes of the weekly quota and one orphaned source object.
+
 ### The download's second route (`source_rescue.py`)
 
 The download is the one stage with no fallback of its own, and what breaks it

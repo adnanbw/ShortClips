@@ -54,12 +54,24 @@ WORKER_SOURCE = WORKER_DIR / "worker.py"
 TERMINAL_OK = {"COMPLETE"}
 TERMINAL_BAD = {"ERROR", "CANCEL_ACKNOWLEDGED"}
 
+#: States that mean the kernel has NOT started yet. KernelWorkerStatus is
+#: QUEUED / RUNNING / COMPLETE / ERROR / CANCEL_REQUESTED /
+#: CANCEL_ACKNOWLEDGED / NEW_SCRIPT.
+NOT_STARTED = {"QUEUED", "NEW_SCRIPT"}
+
 DEFAULT_SLUG = "openshorts-asr-worker"
 #: large-v3, not turbo: the GPU removes both reasons the local path
 #: excludes it (1.8x CPU decode, and an OOM on load), and it is measurably
 #: better on code-switched audio.
 DEFAULT_MODEL = "large-v3"
 DEFAULT_TIMEOUT = 1800.0
+#: How long to wait for a GPU to be ALLOCATED, as opposed to how long the work
+#: may then take. Kaggle's queue is shared and gives no position or estimate,
+#: so a kernel sitting in QUEUED is indistinguishable from one that will never
+#: run — and waiting longer buys nothing, because nothing is happening. The
+#: clock starts at DISPATCH, which is before the local download, so a job that
+#: takes 30s to download has ~7.5 minutes of this left by the time it asks.
+DEFAULT_QUEUE_TIMEOUT = 480.0
 DEFAULT_POLL = 15.0
 
 
@@ -228,9 +240,27 @@ def _status_name(response: Any) -> str:
 
 
 def _wait(api, slug: str, timeout: float, poll: float,
-          on_progress=None) -> Optional[str]:
-    """Block until the kernel reaches a terminal state. Returns the state."""
-    deadline = time.time() + timeout
+          on_progress=None, queue_timeout: Optional[float] = None
+          ) -> Optional[str]:
+    """Block until the kernel reaches a terminal state. Returns the state.
+
+    TWO BUDGETS, because queuing and running fail differently.
+
+    QUEUED means no GPU has been allocated and nothing is happening. Kaggle
+    publishes no queue position and no estimate, so eight minutes of it looks
+    exactly like never, and waiting longer cannot make it start sooner. That
+    wait is pure loss: measured on a real job, 30 minutes of polling followed
+    by the local transcription that would have started immediately anyway.
+
+    RUNNING means the GPU is decoding. Giving up there throws away work that
+    is nearly finished, so it keeps the long budget.
+    """
+    if queue_timeout is None:
+        queue_timeout = timeout
+    started = time.time()
+    deadline = started + timeout
+    queue_deadline = started + min(queue_timeout, timeout)
+    running = False
     last = None
     while time.time() < deadline:
         try:
@@ -241,10 +271,17 @@ def _wait(api, slug: str, timeout: float, poll: float,
             continue
 
         state = _status_name(response)
+        if state not in NOT_STARTED:
+            # Latched, not recomputed: a terminal state also means it ran, and
+            # a status call that briefly reports QUEUED again after RUNNING
+            # must not put the short budget back in force.
+            running = True
         if state != last:
             last = state
-            remaining = int(deadline - time.time())
-            print(f"☁️ Kaggle {state.lower()} (timeout in {remaining}s)")
+            limit = deadline if running else queue_deadline
+            print(f"☁️ Kaggle {state.lower()} "
+                  f"({'timeout' if running else 'giving up'} in "
+                  f"{int(limit - time.time())}s)")
             if on_progress:
                 on_progress(state)
 
@@ -255,6 +292,24 @@ def _wait(api, slug: str, timeout: float, poll: float,
             if message:
                 print(f"⚠️ Kaggle kernel failed: {message}")
             return state
+
+        if not running and time.time() >= queue_deadline:
+            # The abandoned kernel is NOT cancelled, and that is a limitation
+            # of the API rather than a choice. kagglesdk does expose
+            # CancelKernelSession, but its endpoint is
+            # /api/v1/kernels/cancel-session/{kernel_session_id} and nothing
+            # hands out that id: kernels_status returns only status +
+            # failureMessage, and kernels_push returns kernel_id, which is the
+            # KERNEL, not the session. Passing a kernel id to a global
+            # session-cancel endpoint could cancel a session belonging to
+            # someone else, so it is not guessed. The cost of leaving it is a
+            # few minutes of the weekly GPU quota and one orphaned source
+            # object, which the lifecycle rule on kaggle-source/ sweeps.
+            print(f"⚠️ Kaggle is still queued after {queue_timeout:.0f}s — no "
+                  f"GPU was allocated, so there is nothing to wait for. "
+                  f"Transcribing locally instead. (The kernel will still run "
+                  f"when Kaggle gets to it; its output is ignored.)")
+            return None
         time.sleep(poll)
 
     print(f"⚠️ Kaggle did not finish within {timeout:.0f}s.")
@@ -540,6 +595,8 @@ def transcribe_url(url: str, job_id: str = "job", language: Optional[str] = None
         timeout=_env_float("KAGGLE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT),
         poll=_env_float("KAGGLE_POLL_SECONDS", DEFAULT_POLL),
         on_progress=on_progress,
+        queue_timeout=_env_float("KAGGLE_QUEUE_TIMEOUT_SECONDS",
+                                 DEFAULT_QUEUE_TIMEOUT),
     )
     if state not in TERMINAL_OK:
         # A kernel that ERRORed may still have uploaded the source video

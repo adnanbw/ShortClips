@@ -343,6 +343,50 @@ class TestFailureIsNeverFatal:
         kaggle_worker.transcribe_url("https://youtu.be/X")
         assert seen.get("page_token") is None
 
+    def test_a_queued_kernel_is_abandoned_on_the_SHORT_budget(self, monkeypatch):
+        """QUEUED means no GPU was allocated and nothing is happening.
+
+        Measured: a real job polled a queued kernel for the full 1800s and
+        then ran the local transcription that could have started at once.
+        Kaggle publishes no queue position, so eight minutes of QUEUED is
+        indistinguishable from never.
+        """
+        _configured(monkeypatch)
+        monkeypatch.setenv("KAGGLE_QUEUE_TIMEOUT_SECONDS", "0")
+        api = _install(monkeypatch, _FakeApi(
+            states=("QUEUED",), output={"transcript.json": _transcript()}))
+        assert kaggle_worker.transcribe_url("https://youtu.be/X") is None
+        # Abandoned on the first look, not polled out to the long timeout.
+        assert api.status_calls == 1
+
+    def test_a_running_kernel_keeps_the_LONG_budget(self, monkeypatch):
+        """Once the GPU is decoding, giving up throws away nearly-done work."""
+        _configured(monkeypatch)
+        monkeypatch.setenv("KAGGLE_QUEUE_TIMEOUT_SECONDS", "0")
+        _install(monkeypatch, _FakeApi(
+            states=("RUNNING", "RUNNING", "COMPLETE"),
+            output={"transcript.json": _transcript()}))
+        assert kaggle_worker.transcribe_url("https://youtu.be/X") is not None
+
+    def test_queuing_then_running_keeps_the_long_budget(self, monkeypatch):
+        """The normal path: a short queue, then work. The short budget must
+        stop applying the moment it starts, not stay armed for the run."""
+        _configured(monkeypatch)
+        monkeypatch.setenv("KAGGLE_QUEUE_TIMEOUT_SECONDS", "0.05")
+        monkeypatch.setenv("KAGGLE_POLL_SECONDS", "0.02")
+        _install(monkeypatch, _FakeApi(
+            states=("QUEUED", "RUNNING", "RUNNING", "RUNNING", "COMPLETE"),
+            output={"transcript.json": _transcript()}))
+        assert kaggle_worker.transcribe_url("https://youtu.be/X") is not None
+
+    def test_the_queue_budget_never_outlives_the_overall_one(self, monkeypatch):
+        """A deployment that lowers only KAGGLE_TIMEOUT_SECONDS must not get
+        a LONGER wait from the queue default it never touched."""
+        _configured(monkeypatch)
+        monkeypatch.setenv("KAGGLE_TIMEOUT_SECONDS", "0")
+        _install(monkeypatch, _FakeApi(states=("QUEUED",)))
+        assert kaggle_worker.transcribe_url("https://youtu.be/X") is None
+
     def test_a_status_call_that_throws_does_not_end_the_wait(self, monkeypatch):
         _configured(monkeypatch)
 
