@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
 import { getApiUrl } from '../config';
 
@@ -36,7 +36,47 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
+    // Split mode: cut a chosen range into fixed-length pieces with no model at
+    // all. A mode switch rather than a separate tab, because everything else
+    // about the flow — source, output format, the clip grid, scheduling — is
+    // identical and a tab would duplicate all of it.
+    const [splitMode, setSplitMode] = useState(false);
+    const [splitSeconds, setSplitSeconds] = useState('90');
+    const [splitStart, setSplitStart] = useState('');
+    const [splitEnd, setSplitEnd] = useState('');
+    const [splitSnap, setSplitSnap] = useState(true);
     const infoRef = useRef(null);
+
+    // Same spellings split_selector.parse_timecode accepts, because a user
+    // reading times off a video player types "1:30", not "90".
+    const readTimecode = (text) => {
+        const value = String(text ?? '').trim();
+        if (!value) return null;
+        const parts = value.split(':').map(Number);
+        if (parts.some((n) => Number.isNaN(n))) return null;
+        return parts.reduce((total, n) => total * 60 + n, 0);
+    };
+
+    // What the chosen range will actually produce, while the form is still on
+    // screen. "5 parts of a 30-minute range" is 6-minute clips that Instagram
+    // refuses, and finding that out after a film has downloaded and rendered
+    // is a bad way to learn it.
+    const splitPlan = useMemo(() => {
+        if (!splitMode) return '';
+        const seconds = Number(splitSeconds) || 90;
+        const from = readTimecode(splitStart);
+        const to = readTimecode(splitEnd);
+        if (seconds > 180) return `${seconds}s is over the 3-minute Reels and Shorts cap.`;
+        if (from == null || to == null) return '';
+        const span = to - from;
+        if (span <= 0) return 'That range ends before it starts.';
+        // Mirrors split_selector.plan_boundaries: a tail under 20s is absorbed
+        // into the piece before it rather than shipped as its own clip.
+        const whole = Math.floor(span / seconds);
+        const tail = span - whole * seconds;
+        const pieces = tail >= 20 ? whole + 1 : Math.max(1, whole);
+        return `≈ ${pieces} piece${pieces === 1 ? '' : 's'} of ${seconds}s.`;
+    }, [splitMode, splitSeconds, splitStart, splitEnd]);
 
     // Close the compatibility popover on any outside click.
     useEffect(() => {
@@ -78,7 +118,18 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const handleSubmit = (e) => {
         e.preventDefault();
         if (!acknowledged) return;
-        const advanced = {
+        const advanced = splitMode ? {
+            // Split mode deliberately drops the AI controls rather than
+            // sending them to be ignored: there is no clip count to target and
+            // no hook to write, and a request that carries them reads as if
+            // they might still apply.
+            layout,
+            splitMode: true,
+            splitSeconds: splitSeconds || '90',
+            splitStart: splitStart || null,
+            splitEnd: splitEnd || null,
+            splitSnap,
+        } : {
             targetClips: targetClips || null,
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
@@ -208,6 +259,88 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 )}
 
+                {/* How the clips are chosen. A mode switch rather than a second
+                    tab: the source picker, the output format, the clip grid and
+                    the scheduling modal are identical either way. */}
+                <div className="mt-5">
+                    <p className="eyebrow mb-2">How to cut</p>
+                    <div className="grid grid-cols-2 gap-2">
+                        {[
+                            { value: false, label: 'find moments', hint: 'AI picks the good bits' },
+                            { value: true, label: 'fixed split', hint: 'equal pieces · no AI' },
+                        ].map((m) => (
+                            <button
+                                key={String(m.value)}
+                                type="button"
+                                onClick={() => setSplitMode(m.value)}
+                                className={`p-3 rounded border text-left transition-colors ${splitMode === m.value
+                                    ? 'border-brass bg-brass/5'
+                                    : 'border-rule hover:border-ink2'
+                                    }`}
+                            >
+                                <span className="block font-mono text-sm leading-none lowercase">{m.label}</span>
+                                <span className="block mt-1 text-[11px] sm:text-[10px] leading-tight text-muted">{m.hint}</span>
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
+                {splitMode && (
+                    <div className="mt-4 animate-fade">
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-2">
+                            <div>
+                                <p className="eyebrow mb-1.5">piece length (s)</p>
+                                <input
+                                    type="number" min="5" max="600" step="5"
+                                    value={splitSeconds}
+                                    onChange={(e) => setSplitSeconds(e.target.value)}
+                                    placeholder="90"
+                                    className="input-field"
+                                />
+                            </div>
+                            <div>
+                                <p className="eyebrow mb-1.5">from</p>
+                                <input
+                                    type="text"
+                                    value={splitStart}
+                                    onChange={(e) => setSplitStart(e.target.value)}
+                                    placeholder="start"
+                                    className="input-field"
+                                />
+                            </div>
+                            <div>
+                                <p className="eyebrow mb-1.5">to</p>
+                                <input
+                                    type="text"
+                                    value={splitEnd}
+                                    onChange={(e) => setSplitEnd(e.target.value)}
+                                    placeholder="end"
+                                    className="input-field"
+                                />
+                            </div>
+                        </div>
+                        <p className="mt-2 text-[11px] text-muted leading-snug">
+                            Times as <span className="font-mono">1:30</span> or{' '}
+                            <span className="font-mono">00:01:30</span> or seconds. Leave blank for the whole video.
+                            {splitPlan && <span className="text-ink2"> {splitPlan}</span>}
+                        </p>
+                        <label className="mt-3 flex items-center gap-2 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={splitSnap}
+                                onChange={(e) => setSplitSnap(e.target.checked)}
+                                className="accent-brass"
+                            />
+                            <span className="text-xs text-ink2 lowercase">
+                                snap cuts to quiet moments
+                            </span>
+                        </label>
+                        <p className="mt-2 text-[11px] text-muted leading-snug">
+                            No captions, no hook and no AI in this mode — it cuts where you say and keeps the whole picture.
+                        </p>
+                    </div>
+                )}
+
                 {/* Output format selector */}
                 <div className="mt-5" data-tutorial="output-format">
                     <p className="eyebrow mb-2">Output format</p>
@@ -244,8 +377,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 </div>
 
-                {/* Advanced generation controls — collapsed by default; blank = AI decides */}
-                <div className="mt-4">
+                {/* Advanced generation controls — collapsed by default; blank = AI
+                    decides. Hidden entirely in split mode: there is no clip count
+                    to target, no length band to set and no hook to write, and
+                    showing dead controls reads as if they might still apply. */}
+                <div className="mt-4" hidden={splitMode}>
                     <button
                         type="button"
                         onClick={() => setShowAdvanced((v) => !v)}

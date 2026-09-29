@@ -1987,12 +1987,22 @@ if __name__ == '__main__':
     parser.add_argument('--clips-json', type=str,
                         help=("Path to precomputed clip-selection JSON containing a 'shorts' array. "
                               "Skips AI clip selection and renders those clips directly."))
-    parser.add_argument('--selector', type=str, choices=['meaningful', 'legacy'], default=None,
-                        help=("Transcript clip selector. Default: CLIP_SELECTOR env or 'meaningful'. "
-                              "Use 'legacy' to run the original OpenShorts viral selector."))
+    parser.add_argument('--selector', type=str,
+                        choices=['meaningful', 'legacy', 'split'], default=None,
+                        help=("Clip selector. Default: CLIP_SELECTOR env or 'meaningful'. "
+                              "'legacy' runs the original OpenShorts viral selector. "
+                              "'split' cuts a fixed grid over SPLIT_START..SPLIT_END "
+                              "with no model and no transcription at all."))
 
     args = parser.parse_args()
     output_format = args.format
+
+    # The split selector cuts a fixed grid over a range the user chose. It
+    # reads no words, so this mode transcribes nothing — which also means it
+    # must not dispatch to Kaggle, or every split job would queue for a GPU
+    # to produce a transcript nobody reads and spend the weekly quota doing it.
+    splitting = (args.selector
+                 or os.environ.get('CLIP_SELECTOR', '')).strip().lower() == 'split'
 
     script_start_time = time.time()
     
@@ -2024,7 +2034,8 @@ if __name__ == '__main__':
         # whole download plus the local language probe, ~50-90s per job, while
         # the GPU sat idle. The language probe now runs inside the worker, on
         # the GPU, which is what removed the dependency.
-        remote_transcription = kaggle_worker_start(args.url, output_dir)
+        remote_transcription = (
+            None if splitting else kaggle_worker_start(args.url, output_dir))
         try:
             input_video, video_title = download_youtube_video(
                 args.url, output_dir)
@@ -2123,12 +2134,12 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"⚠️ Could not use precomputed transcript ({e}) — transcribing normally.")
                 transcript = None
-        if transcript is None:
+        if transcript is None and not splitting:
             transcript = load_transcript_checkpoint(output_dir, input_video, duration)
             if transcript is not None:
                 print(f"♻️ Reusing the transcript from the interrupted run "
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
-        if transcript is None:
+        if transcript is None and not splitting:
             try:
                 transcript = transcribe_video(
                     input_video, duration=duration, output_dir=output_dir,
@@ -2239,6 +2250,18 @@ if __name__ == '__main__':
             except Exception as e:
                 raise RuntimeError(f"Could not load precomputed clips: {e}") from e
 
+        elif splitting:
+            # BEFORE the transcript check, deliberately. Split mode never
+            # transcribes, so `transcript is None` here is normal — falling
+            # through to the `else` would hand a film to the Gemini VISION
+            # selector, which is a model call this mode exists to avoid and a
+            # wrong answer besides.
+            import split_selector
+            print('🧠 Selector: split (fixed grid, no model)')
+            clips_data = split_selector.build_clips(
+                input_video, duration, output_format=output_format,
+                title=video_title, **split_selector.options_from_env())
+
         elif transcript is not None:
             selector_mode = (
                 args.selector
@@ -2340,7 +2363,14 @@ if __name__ == '__main__':
                     ]
                     subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-                    success = render_clip(clip_temp_path, clip_final_path, output_format)
+                    # `force_strategy` pins every scene's layout. Split mode
+                    # sets WIDE so a film is fitted whole into the output frame
+                    # rather than cropped in on a face — and so no detector
+                    # runs, which is what makes this mode cheap. None for every
+                    # other selector, i.e. exactly the previous behaviour.
+                    success = render_clip(clip_temp_path, clip_final_path,
+                                          output_format,
+                                          force_strategy=clips_data.get('force_strategy'))
                     # Layer order: watermark burns into the canonical (so any
                     # later hook replacement, which re-derives from it, keeps
                     # the branding), the hook is a derived hooked_ file, and

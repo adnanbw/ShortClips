@@ -883,6 +883,14 @@ function App() {
         auto_hook_style: data.autoHook ? (data.autoHookStyle || 'classic') : null,
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
+        // Split mode: fixed-length pieces of a chosen range, no model at all.
+        // Only sent when it is on, so an ordinary request is unchanged.
+        split: data.splitMode ? '1' : null,
+        split_seconds: data.splitMode ? (data.splitSeconds || '90') : null,
+        split_start: data.splitMode ? (data.splitStart || null) : null,
+        split_end: data.splitMode ? (data.splitEnd || null) : null,
+        // Explicit both ways: the default is on, so "off" has to be stated.
+        split_snap: data.splitMode ? (data.splitSnap ? '1' : '0') : null,
       };
 
       if (data.type === 'url') {

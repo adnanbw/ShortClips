@@ -2179,6 +2179,15 @@ async def process_endpoint(
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
+    # Split mode: cut a chosen range into fixed-length pieces with no model at
+    # all. See split_selector.py — it is a third selector, not a second
+    # pipeline, so everything downstream is unchanged.
+    split: Optional[str] = Form(None),
+    split_seconds: Optional[str] = Form(None),
+    split_start: Optional[str] = Form(None),
+    split_end: Optional[str] = Form(None),
+    split_overlap: Optional[str] = Form(None),
+    split_snap: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
@@ -2213,6 +2222,16 @@ async def process_endpoint(
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
+        # Split mode travels on this path too. A URL job posts JSON and a file
+        # job posts multipart, so a field added only to the signature above is
+        # silently dropped for every YouTube link — which looks like the
+        # feature not working rather than like a missing line here.
+        split = body.get("split")
+        split_seconds = body.get("split_seconds")
+        split_start = body.get("split_start")
+        split_end = body.get("split_end")
+        split_overlap = body.get("split_overlap")
+        split_snap = body.get("split_snap")
         upload_id = body.get("upload_id")
 
     # Normalize output format (auto = keep pipeline default).
@@ -2385,6 +2404,46 @@ async def process_endpoint(
     if captions is not None and str(captions).lower() in ("0", "false", "no"):
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
+
+    # Split mode. The range is validated HERE rather than in main.py because a
+    # bad range should be a 400 the user sees while the form is still in front
+    # of them, not a job that queues, downloads a film and then fails.
+    if split is not None and str(split).lower() in ("1", "true", "yes"):
+        import split_selector
+        seconds = split_selector.parse_timecode(split_seconds)
+        span_start = split_selector.parse_timecode(split_start)
+        span_end = split_selector.parse_timecode(split_end)
+        if seconds is None:
+            seconds = split_selector.DEFAULT_CLIP_SECONDS
+        if not split_selector.MIN_CLIP_SECONDS <= seconds <= 600:
+            raise HTTPException(
+                status_code=400,
+                detail=f"split_seconds must be between "
+                       f"{split_selector.MIN_CLIP_SECONDS:.0f} and 600")
+        if (span_start is not None and span_end is not None
+                and span_end - span_start < split_selector.MIN_CLIP_SECONDS):
+            raise HTTPException(
+                status_code=400,
+                detail="split_end must be at least "
+                       f"{split_selector.MIN_CLIP_SECONDS:.0f}s after split_start")
+
+        env["CLIP_SELECTOR"] = "split"
+        env["SPLIT_CLIP_SECONDS"] = str(seconds)
+        if span_start is not None:
+            env["SPLIT_START"] = str(span_start)
+        if span_end is not None:
+            env["SPLIT_END"] = str(span_end)
+        overlap = split_selector.parse_timecode(split_overlap)
+        if overlap is not None:
+            env["SPLIT_OVERLAP_SECONDS"] = str(overlap)
+        if split_snap is not None and str(split_snap).lower() in ("0", "false", "no"):
+            env["SPLIT_SNAP"] = "0"
+        # Nothing in this mode reads the transcript, so the two stages that
+        # would need one are pointless spend rather than a missing feature.
+        env["AUTO_CAPTIONS"] = "0"
+        env["AUTO_HOOK"] = "0"
+        print(f"[split] job={job_id} {seconds:.0f}s pieces "
+              f"range={span_start}-{span_end} snap={env.get('SPLIT_SNAP', '1')}")
 
     input_path = None
     if url:

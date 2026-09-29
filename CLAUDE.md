@@ -410,6 +410,78 @@ an RTL block — the runs, not the words: libass still bidi-orders *inside* a
 run, so reversing the words as well cancels itself out. `\q2` disables
 auto-wrap there, because the flip is only valid for a single visual line.
 
+### Split mode: fixed pieces, no model (`split_selector.py`)
+
+The meaningful selector answers "which moments are worth publishing", which is
+the right question for a podcast and the wrong one for a film. There is no
+viral moment to find in a movie scene: the user has already decided what they
+want by choosing a time range, and all that is left is to chop it into pieces a
+platform accepts.
+
+So it is a **third selector, not a second pipeline**. It emits the same
+`{"shorts": [...]}` every other selector emits, and the cut, the framing, the
+clip grid, Instagram scheduling, History and downloads are untouched because
+none of them knows which selector produced the ranges. `--selector split` or
+`CLIP_SELECTOR=split`; the dashboard exposes it as a "how to cut" switch beside
+the output format, deliberately not a separate tab (the source picker, the
+format, the grid and the scheduling modal are identical either way, and a tab
+would duplicate all four).
+
+**Zero model calls, and no transcription either.** That is the point: on a
+one-core box transcription is ~10 minutes spent on words nothing in this mode
+reads. `main.py` therefore skips the transcript AND the Kaggle dispatch when
+`splitting` — otherwise every split job would queue for a GPU to produce a
+transcript nobody opens, and spend the weekly quota doing it. `app.py` also
+forces `AUTO_CAPTIONS=0` and `AUTO_HOOK=0`, after the blocks that set them from
+their own params, or those would win.
+
+**The dispatch sits BEFORE the `elif transcript is not None` branch**, and that
+ordering is load-bearing: split mode leaves `transcript` as None, so a branch
+placed after it falls through to `get_visual_clips` — handing a film to the
+Gemini VISION selector, which is both a model call this mode exists to avoid
+and a wrong answer.
+
+**Overlap is a lead-in, not a symmetric pad.** The failure a viewer notices is
+a clip that STARTS mid-sentence — the first thing they hear is half a word. A
+clip that ends a beat early reads as an edit. So the repeat is spent entirely
+at the start of the following piece, and the first piece never gets one (it
+would reach outside the chosen range).
+
+**Cuts snap to pauses, and that is signal processing rather than a model.**
+A flat 90-second grid lands mid-word whenever there is speech. `silencedetect`
+costs one fast audio pass and the middle of a pause is where a human would cut;
+each interior boundary moves to the nearest pause within `SNAP_TOLERANCE` (3s)
+and stays put when there is none, so a continuous soundtrack degrades to the
+flat grid instead of drifting. Only INTERIOR boundaries move — snapping the
+outer two would include footage from outside the range the user picked. Two
+traps: `-ss` goes **before** `-i` so ffmpeg seeks instead of decoding a whole
+film, which means silencedetect reports times relative to the SEEK POINT and
+the offset has to be added back (getting it wrong moves every cut in the job by
+the trim offset, silently); and boundaries are kept monotonic, because two
+landing on one long pause would otherwise ask ffmpeg to cut `end <= start`.
+
+**Vertical output is `force_strategy='WIDE'`, never the tracker.** WIDE is the
+GENERAL layout with side-cropping disabled — the whole picture fitted into the
+frame over a blurred copy of itself. Cropping in on a face is wrong for film,
+where the framing IS the content, and it would drag a per-frame detector into
+the no-model path; `reframe_v2` needs no camera trajectory for GENERAL/WIDE, so
+this costs one encode and no inference. `render_clip` gained a `force_strategy`
+argument from `clips_data`, `None` for every other selector.
+
+A trailing remainder under `MIN_TAIL_SECONDS` (20) is absorbed into the piece
+before it: at 90s pieces a 7-second offcut is not a "Part 7 of 7". No hook text
+is invented — the hook is BURNED onto the video, writing one needs a model, and
+a made-up hook over someone's film is worse than none.
+
+Two wiring details with tests, because both fail silently: `/api/process`
+re-reads every field by hand in its `application/json` branch, so a field added
+only to the endpoint signature is dropped for every URL job while working fine
+for uploads; and argparse `choices` must list `split`, or the mode is reachable
+only through the env var and cannot be reproduced by hand. The dashboard
+computes the piece count live and warns past the 3-minute Reels/Shorts cap —
+"5 parts of a 30-minute range" is 6-minute clips Instagram refuses, and after a
+film has downloaded and rendered is a bad time to learn it.
+
 ### Remote transcription on Kaggle (`kaggle_worker.py`, `kaggle-worker/`)
 
 Transcription is the long pole of a job — ~16 minutes of CPU for a 9.5-minute
