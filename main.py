@@ -880,6 +880,15 @@ def download_youtube_video(url, output_dir="."):
     def _base_opts(extractor_args, proxy, cookies=True):
         return {
             'quiet': False, 'verbose': True, 'no_warnings': False,
+            # ONE video, never the playlist it happens to be playing inside.
+            # A link copied while a YouTube Mix or radio is running carries
+            # `&list=RD…`, and yt-dlp's default is to take the whole list:
+            # a real 3-minute song came back as "Downloading 1407 items of
+            # 1407" and the job was still going a quarter of an hour later.
+            # It is not a hang and nothing reports an error — the log just
+            # scrolls other people's videos. The Kaggle worker always passed
+            # --no-playlist; this path never did.
+            'noplaylist': True,
             'cookiefile': cookies_path if (cookies and cookies_path) else None,
             'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
             'nocheckcertificate': True, 'cachedir': False,

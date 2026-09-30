@@ -410,6 +410,20 @@ an RTL block — the runs, not the words: libass still bidi-orders *inside* a
 run, so reversing the words as well cancels itself out. `\q2` disables
 auto-wrap there, because the flip is only valid for a single visual line.
 
+### A YouTube link can carry a playlist
+
+`&list=RD…&start_radio=1` is what you copy when you click a song while a Mix or
+radio is playing, and yt-dlp's DEFAULT is to take the LIST. Measured on a real
+3-minute song (30-sep-2026): *"Downloading 1407 items of 1407"*, 31 pages of
+playlist API calls, and the job still running a quarter of an hour later.
+Nothing reports an error — the log just scrolls other people's videos, so it
+reads as a hang in whatever stage was expected next. `noplaylist` is set in
+`main._base_opts` (so both the `extract_info` and the download get it) and in
+`cloud.metering`'s duration probe, where `skip_download` stops the fetch but
+`extract_info` still walks the list and `duration` on a playlist is None — the
+video is then metered as unmeasurable rather than as its real length. The
+Kaggle worker always passed `--no-playlist`; these two never did.
+
 ### Split mode: fixed pieces, no model (`split_selector.py`)
 
 The meaningful selector answers "which moments are worth publishing", which is

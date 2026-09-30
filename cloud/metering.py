@@ -245,7 +245,13 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                                             for e in static_errors.values()):
                 break
         for extractor_args in strategies:
+            # noplaylist for the same reason the download sets it: a link
+            # copied out of a YouTube Mix carries `&list=RD…`, and without
+            # this the probe enumerates the whole list (31 API pages for a
+            # 1407-item radio) and then reads `duration` off a PLAYLIST,
+            # which has none — so the video is metered as unmeasurable.
             opts = {"skip_download": True, "quiet": True, "no_warnings": True,
+                    "noplaylist": True,
                     "logger": _QuietLogger(), "extractor_args": extractor_args}
             if ck_path:
                 opts["cookiefile"] = ck_path
