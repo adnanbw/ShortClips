@@ -19,9 +19,16 @@ jobs:
       # the tests exercise the gated-off paths. numpy+opencv cover the layout
       # modules, fastapi/boto3/PyJWT/python-multipart cover importing app.py
       # for the MCP endpoint tests, google-genai covers gemini_worker.
+      # sqlalchemy[asyncio], not plain sqlalchemy: cloud/database.py imports
+      # sqlalchemy.ext.asyncio, which needs `greenlet`, and SQLAlchemy stopped
+      # installing that automatically. The failure is a COLLECTION error on
+      # tests/test_account_erasure.py, and a collection error aborts the whole
+      # run with exit code 2 — so CI reported "1280 items collected" and then
+      # executed NONE of them, on every push, for as long as the drift lasted.
+      # A red CI nobody can act on is a CI nobody reads.
       - name: Install test dependencies
         run: >
-          pip install pytest pillow httpx pydantic sqlalchemy numpy
+          pip install pytest pillow httpx pydantic "sqlalchemy[asyncio]" numpy
           opencv-python-headless python-dotenv google-genai fastapi boto3
           PyJWT email-validator python-multipart
       - name: Run tests
