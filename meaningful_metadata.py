@@ -359,83 +359,20 @@ def generate_metadata_with_gemini(
         max_attempts: int = 6,
     ):
 
-        delays = [
-            5,
-            10,
-            20,
-            30,
-            45,
-            60,
-        ]
-
-        last_error = None
-
-        for attempt in range(
-            1,
-            max_attempts + 1
-        ):
-
-            try:
-
-                return (
-                    client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=config,
-                    )
-                )
-
-            except Exception as exc:
-
-                last_error = exc
-
-                error_text = str(
-                    exc
-                ).lower()
-
-                retryable = any(
-                    marker in error_text
-                    for marker in (
-                        "503",
-                        "unavailable",
-                        "high demand",
-                        "429",
-                        "resource_exhausted",
-                        "500",
-                        "internal",
-                    )
-                )
-
-                if (
-                    not retryable
-                    or attempt >= max_attempts
-                ):
-                    raise
-
-                delay = delays[
-                    min(
-                        attempt - 1,
-                        len(delays) - 1
-                    )
-                ]
-
-                print(
-                    "  Gemini metadata "
-                    "temporarily unavailable. "
-                    f"Retry {attempt}/{max_attempts} "
-                    f"in {delay}s..."
-                )
-
-                time.sleep(
-                    delay
-                )
-
-        if last_error:
-            raise last_error
-
-        raise RuntimeError(
-            "Gemini metadata request failed."
-        )
+        # Shared policy (gemini_calls): paced under the per-minute quota and
+        # retried PER CALL, so one rate limit never discards finished work.
+        import gemini_calls
+        try:
+            return gemini_calls.call(
+                client,
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+        except Exception:
+            print(f"  Gemini metadata failed after "
+                  f"{gemini_calls.attempts()} attempts.")
+            raise
 
     # ------------------------------------------------------------------------
     # Response parser

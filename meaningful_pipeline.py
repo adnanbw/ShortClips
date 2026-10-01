@@ -60,47 +60,27 @@ def _save_json(output_dir: Optional[str], filename: str, data: Any) -> None:
 
 
 def _retry_stage(stage_name: str, fn, *, max_attempts: int = 3):
-    """Retry a whole stage only for transient API/network failures."""
-    delays = [10, 20, 40]
+    """Run a stage. Names it in the error; does NOT re-run it.
 
-    for attempt in range(max_attempts):
-        try:
-            return fn()
-        except Exception as exc:
-            text = str(exc).lower()
-            transient_markers = (
-                "429",
-                "500",
-                "502",
-                "503",
-                "504",
-                "resource_exhausted",
-                "unavailable",
-                "temporarily unavailable",
-                "timeout",
-                "timed out",
-                "rate limit",
-                "rate_limit",
-                "connection reset",
-                "connection aborted",
-            )
-            transient = any(marker in text for marker in transient_markers)
+    It used to retry the WHOLE stage on any transient error, and that turned a
+    recoverable rate limit into an unwinnable job. Measured on a 50-minute
+    video (30-sep-2026): the Candidate Finder completed 13 of 22 windows, hit
+    the free tier's 15-per-minute limit on the 14th, and this function threw
+    away all 13 and started again from window 1. The second attempt redid
+    twelve before failing; the third died on window 2. Twenty-six calls, no
+    output, and every attempt left the quota in a worse state than the one
+    before — the further the stage got, the more certain its next run was to
+    fail.
 
-            if not transient or attempt >= max_attempts - 1:
-                raise
-
-            delay = delays[min(attempt, len(delays) - 1)]
-            print(
-                f"⚠️ {stage_name} temporary failure "
-                f"({type(exc).__name__}: {exc})"
-            )
-            print(
-                f"   Retrying whole stage in {delay}s "
-                f"({attempt + 2}/{max_attempts})..."
-            )
-            time.sleep(delay)
-
-    raise RuntimeError(f"{stage_name} retry loop exhausted")
+    Retrying is now the job of `gemini_calls`, one CALL at a time, where a
+    rate limit costs seconds instead of a whole stage's work. `max_attempts`
+    is kept so existing callers and tests still pass it.
+    """
+    try:
+        return fn()
+    except Exception as exc:
+        print(f"❌ {stage_name} failed ({type(exc).__name__}: {exc})")
+        raise
 
 
 def _meaningful_max_clips() -> int:

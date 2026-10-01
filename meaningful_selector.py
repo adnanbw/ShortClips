@@ -797,8 +797,10 @@ def repair_overlong_candidate(
         transcript=format_sentences_for_ai(window),
     )
 
+    import gemini_calls
     try:
-        response = client.models.generate_content(
+        response = gemini_calls.call(
+            client,
             model=model_name or os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite",
             contents=prompt,
             config=genai_types.GenerateContentConfig(
@@ -1033,6 +1035,9 @@ def find_candidates_with_gemini(
     )
 
     raw_candidates = []
+    skipped_windows: List[str] = []
+
+    import gemini_calls as _gemini_calls
 
     for window_number, window in enumerate(
         windows,
@@ -1058,11 +1063,24 @@ def find_candidates_with_gemini(
             transcript=transcript_text,
         )
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=config,
-        )
+        # A window that cannot be analysed is SKIPPED, not fatal. This loop
+        # used to call Gemini bare: the 14th window of a 50-minute video hit
+        # the free tier's 15-per-minute limit, the exception escaped, and
+        # meaningful_pipeline restarted the whole stage — discarding the 13
+        # windows that had already succeeded and spending more quota to redo
+        # them. 21 of 22 windows is a usable result; zero is not.
+        try:
+            response = _gemini_calls.call(
+                client,
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+        except Exception as exc:
+            skipped_windows.append(window["id"])
+            print(f"  {window['id']}: skipped "
+                  f"({type(exc).__name__}: {str(exc)[:160]})")
+            continue
 
         parsed_obj = getattr(
             response,
@@ -1274,5 +1292,15 @@ def find_candidates_with_gemini(
         f"After deduplication: "
         f"{len(final)}"
     )
+
+    # Said plainly, because a thin result from a partly-analysed transcript
+    # looks exactly like a video with few good moments in it.
+    if skipped_windows:
+        print(
+            f"⚠️ {len(skipped_windows)} of {len(windows)} window(s) could not "
+            f"be analysed and were skipped: "
+            f"{', '.join(skipped_windows)}. Fewer candidates than usual is "
+            f"expected; raise GEMINI_RPM only if the key's quota allows it."
+        )
 
     return final

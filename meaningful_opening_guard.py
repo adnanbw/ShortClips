@@ -197,48 +197,20 @@ def _call_structured(
     temperature: float = 0.0,
     max_attempts: int = 5,
 ) -> Any:
-    delays = [5, 10, 20, 30, 45]
-
-    for attempt in range(max_attempts):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                ),
-            )
-            return _response_parsed(response, schema)
-        except Exception as exc:
-            msg = str(exc).lower()
-            transient = any(
-                marker in msg
-                for marker in (
-                    "429",
-                    "500",
-                    "502",
-                    "503",
-                    "504",
-                    "resource_exhausted",
-                    "unavailable",
-                    "timeout",
-                    "temporarily",
-                    "rate limit",
-                )
-            )
-            if not transient or attempt == max_attempts - 1:
-                raise
-
-            delay = delays[min(attempt, len(delays) - 1)]
-            print(
-                f"      Opening guard Gemini retry {attempt + 1}/{max_attempts} "
-                f"after {delay}s: {type(exc).__name__}"
-            )
-            time.sleep(delay)
-
-    raise RuntimeError("Opening guard Gemini retry loop exhausted")
+    # Shared policy (gemini_calls): paced under the per-minute quota and
+    # retried PER CALL, so one rate limit never discards finished work.
+    import gemini_calls
+    response = gemini_calls.call(
+        client,
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=temperature,
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+    return _response_parsed(response, schema)
 
 
 def judge_opening_independence(

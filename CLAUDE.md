@@ -424,6 +424,47 @@ reads as a hang in whatever stage was expected next. `noplaylist` is set in
 video is then metered as unmeasurable rather than as its real length. The
 Kaggle worker always passed `--no-playlist`; these two never did.
 
+### Gemini calls are paced, and retried one CALL at a time (`gemini_calls.py`)
+
+A 50-minute video (30-sep-2026) needs **22** Candidate Finder windows, one call
+each, and the free tier allows **15 requests per minute**. The job made 13
+calls in a few seconds, hit `429 RESOURCE_EXHAUSTED` on the 14th, and
+`_retry_stage` restarted the WHOLE stage from window 1 — discarding all 13
+completed windows. Attempt two redid twelve before dying; attempt three died on
+window 2. Twenty-six calls, no output, and **every attempt left the quota worse
+than the one before**: the further the stage got, the more certain its next run
+was to fail. That video could not have succeeded at any length of wait, and the
+daily allowance was barely touched — a per-MINUTE allowance was spent in a
+burst and the results were then thrown away.
+
+Three changes, and they only work together:
+
+- **Pacing.** `gemini_calls` spaces every call so the rate stays under
+  `GEMINI_RPM` (15, the number the real 429 named; `0` disables it on a billed
+  key). 22 windows costs ~90s against a job that spends ten minutes
+  transcribing. The limiter is process-wide and **spans stages on purpose** — a
+  per-stage one lets the Finder finish exactly on budget and hand a spent quota
+  to the critic, which is the same failure one stage later.
+- **Retry is per CALL.** A rate limit is a property of the moment, not of the
+  work already done. Gemini's own `retryDelay` is used when the error carries
+  one, plus a second, because its figure is the instant the quota frees and
+  landing exactly on it races the server's clock.
+- **A window that still fails is SKIPPED, not fatal.** The Finder was the only
+  stage calling `generate_content` bare — the critic, metadata and opening
+  guard each had their own retry loop, which is why the Finder is where it
+  died. 21 of 22 windows is a usable result; zero is not. Skipped windows are
+  named in the log, because a thin result from a partly-analysed transcript
+  looks exactly like a video with few good moments in it.
+
+`_retry_stage` no longer re-runs anything; it names the stage in the error and
+re-raises. All four stages now share one policy instead of three hand-rolled
+ladders and one bare call.
+
+Known limit: the quota is per KEY, the limiter is per PROCESS, and `app.py`
+runs each job as its own subprocess — two concurrent jobs pace at `GEMINI_RPM`
+each and together exceed it. Fine while jobs run one at a time; the fix would
+be a shared counter, not a lower per-process rate.
+
 ### Split mode: fixed pieces, no model (`split_selector.py`)
 
 The meaningful selector answers "which moments are worth publishing", which is
